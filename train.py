@@ -64,7 +64,7 @@ def main(config: DictConfig):
     assert distributed_backend in ('nccl', 'gloo'), f'{distributed_backend=}'
     strategy = DDPStrategy(process_group_backend=distributed_backend,
                            find_unused_parameters=False,
-                           gradient_as_bucket_view=True) if len(gpus) > 1 else None
+                           gradient_as_bucket_view=True) if len(gpus) > 1 else 'auto'
 
     # ---------------------
     # Data
@@ -130,8 +130,7 @@ def main(config: DictConfig):
         max_epochs=config.training.max_epochs,
         max_steps=config.training.max_steps,
         strategy=strategy,
-        sync_batchnorm=False if strategy is None else True,
-        move_metrics_to_cpu=False,
+        sync_batchnorm=len(gpus) > 1,
         benchmark=config.reproduce.benchmark,
         deterministic=config.reproduce.deterministic_flag,
     )

@@ -107,7 +107,7 @@ class VizCallbackBase(Callback):
             outputs: Optional[Any],
             batch: Any,
             batch_idx: int,
-            dataloader_idx: int,
+            dataloader_idx: int = 0,
     ) -> None:
         log_val_hd = self.log_config.validation.high_dim
         log_freq_val_epochs = log_val_hd.every_n_epochs

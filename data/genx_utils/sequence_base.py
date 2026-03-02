@@ -8,7 +8,7 @@ except ImportError:
     pass
 import numpy as np
 import torch
-from torchdata.datapipes.map import MapDataPipe
+from torch.utils.data import MapDataPipe
 
 from data.genx_utils.labels import ObjectLabelFactory, ObjectLabels
 from data.utils.spatial import get_original_hw

@@ -3,13 +3,10 @@ from typing import Any, Iterator, List, Optional, Type
 import torch as th
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torchdata.datapipes.iter import (
-    Concater,
-    IterableWrapper,
-    IterDataPipe,
-    Zipper,
-)
-from torchdata.datapipes.map import MapDataPipe
+from torch.utils.data import IterDataPipe, MapDataPipe
+from torch.utils.data.datapipes.iter import Concater, IterableWrapper, Zipper
+
+from data.utils.stream_sharded_datapipe import MapToIterDataPipe, CycleIterDataPipe, ZipperIterDataPipe
 
 
 class DummyIterDataPipe(IterDataPipe):
@@ -67,7 +64,7 @@ class ConcatStreamingDataPipe(IterDataPipe):
         """
         assert isinstance(datapipe_list, List)
         assert batch_size > 0
-        streams = Zipper(*(Concater(*(self.augmentation_dp(x.to_iter_datapipe())
+        streams = Zipper(*(Concater(*(self.augmentation_dp(MapToIterDataPipe(x))
                                       for x in self.random_torch_shuffle_list(datapipe_list)))
                            for _ in range(batch_size)))
         return streams
@@ -93,9 +90,9 @@ class ConcatStreamingDataPipe(IterDataPipe):
         """
         worker_info = th.utils.data.get_worker_info()
         local_worker_id = 0 if worker_info is None else worker_info.id
-        worker_id_stream = IterableWrapper([local_worker_id]).cycle(count=None)
+        worker_id_stream = CycleIterDataPipe(IterableWrapper([local_worker_id]))
         zipped_stream = self._get_zipped_streams(datapipe_list=self.datapipe_list, batch_size=self.batch_size)
-        return zipped_stream.zip(worker_id_stream)
+        return ZipperIterDataPipe(zipped_stream, worker_id_stream)
 
     def __iter__(self):
         if self.print_seed_debug:

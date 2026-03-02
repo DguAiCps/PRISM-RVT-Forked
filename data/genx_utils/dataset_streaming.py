@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import List, Union
 
 from omegaconf import DictConfig
-from torchdata.datapipes.map import MapDataPipe
+from torch.utils.data import MapDataPipe
 from tqdm import tqdm
 
 from data.genx_utils.sequence_for_streaming import SequenceForIter, RandAugmentIterDataPipe

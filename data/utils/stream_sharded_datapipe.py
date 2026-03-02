@@ -3,8 +3,58 @@ from typing import Any, List, Optional
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torchdata.datapipes.iter import Concater, IterableWrapper, IterDataPipe, ZipperLongest
-from torchdata.datapipes.map import MapDataPipe
+from itertools import zip_longest
+
+from torch.utils.data import IterDataPipe, MapDataPipe
+from torch.utils.data.datapipes.iter import Concater, IterableWrapper
+
+
+class MapToIterDataPipe(IterDataPipe):
+    """Replacement for MapDataPipe.to_iter_datapipe() removed in newer PyTorch."""
+    def __init__(self, map_datapipe: MapDataPipe):
+        super().__init__()
+        self.map_datapipe = map_datapipe
+
+    def __iter__(self):
+        for i in range(len(self.map_datapipe)):
+            yield self.map_datapipe[i]
+
+
+class CycleIterDataPipe(IterDataPipe):
+    """Replacement for IterDataPipe.cycle() removed in newer PyTorch."""
+    def __init__(self, source_dp: IterDataPipe, count=None):
+        super().__init__()
+        self.source_dp = source_dp
+        self.count = count  # None = infinite
+
+    def __iter__(self):
+        if self.count is None:
+            while True:
+                yield from self.source_dp
+        else:
+            for _ in range(self.count):
+                yield from self.source_dp
+
+
+class ZipperIterDataPipe(IterDataPipe):
+    """Replacement for IterDataPipe.zip() removed in newer PyTorch."""
+    def __init__(self, *datapipes: IterDataPipe):
+        super().__init__()
+        self.datapipes = datapipes
+
+    def __iter__(self):
+        yield from zip(*self.datapipes)
+
+
+class ZipperLongest(IterDataPipe):
+    """Replacement for torchdata.datapipes.iter.ZipperLongest removed in torchdata 0.11."""
+    def __init__(self, *datapipes: IterDataPipe, fill_value=None):
+        super().__init__()
+        self.datapipes = datapipes
+        self.fill_value = fill_value
+
+    def __iter__(self):
+        yield from zip_longest(*self.datapipes, fillvalue=self.fill_value)
 
 
 class ShardedStreamingDataPipe(IterDataPipe):
@@ -62,7 +112,7 @@ class ShardedStreamingDataPipe(IterDataPipe):
             batch_idx = next(batch_id_generator)
             zipped_streams[batch_idx].append(datapipe)
         for idx, streams in enumerate(zipped_streams):
-            zipped_streams[idx] = Concater(*(stream.to_iter_datapipe() for stream in streams))
+            zipped_streams[idx] = Concater(*(MapToIterDataPipe(stream) for stream in streams))
         zipped_streams = ZipperLongest(*zipped_streams, fill_value=self.fill_value)
         return zipped_streams
 
@@ -88,7 +138,7 @@ class ShardedStreamingDataPipe(IterDataPipe):
         # its state based on the local worker id. We don't need the global worker id for that because the states
         # are saved in each DDP process (per GPU) separately and do not to communicate with each other.
 
-        worker_id_stream = IterableWrapper([local_worker_id]).cycle(count=None)
-        zipped_stream = zipped_stream.zip(worker_id_stream)
+        worker_id_stream = CycleIterDataPipe(IterableWrapper([local_worker_id]))
+        zipped_stream = ZipperIterDataPipe(zipped_stream, worker_id_stream)
 
         return iter(zipped_stream)

@@ -9,7 +9,7 @@ except ImportError:
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from torchdata.datapipes.iter import IterDataPipe
+from torch.utils.data import IterDataPipe
 
 from data.genx_utils.labels import SparselyBatchedObjectLabels
 from data.genx_utils.sequence_base import SequenceBase, get_objframe_idx_2_repr_idx

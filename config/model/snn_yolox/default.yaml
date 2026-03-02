@@ -1,0 +1,40 @@
+# @package _global_
+defaults:
+  - override /model: rnndet
+
+model:
+  backbone:
+    name: SNNCNN
+    input_channels: 20
+    enable_masking: false
+    embed_dim: 64
+    dim_multiplier: [1, 2, 4, 8]
+    num_conv_layers: [2, 2, 2, 2]
+    stem:
+      patch_size: 4
+    snn:
+      beta_init: 0.9
+      learn_beta: true
+      threshold: 1.0
+      reset_mechanism: subtract
+  fpn:
+    name: PAFPN
+    compile:
+      enable: false
+      args:
+        mode: reduce-overhead
+    depth: 0.67
+    in_stages: [2, 3, 4]
+    depthwise: false
+    act: "silu"
+  head:
+    name: YoloX
+    compile:
+      enable: false
+      args:
+        mode: reduce-overhead
+    depthwise: false
+    act: "silu"
+  postprocess:
+    confidence_threshold: 0.1
+    nms_threshold: 0.45

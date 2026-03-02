@@ -39,6 +39,11 @@ def dynamically_modify_train_config(config: DictConfig):
                 assert (mdl_hw[1] // 32) % partition_size[1] == 0, f'{mdl_hw[1]=}, {partition_size[1]=}'
                 print(f'Set partition sizes: {partition_size}')
                 attention_cfg.partition_size = partition_size
+            elif backbone_name == 'SNNCNN':
+                # SNN-CNN needs resolution aligned to total stride (32) for clean spatial division.
+                mdl_hw = _get_modified_hw_multiple_of(hw=dataset_hw, multiple_of=32)
+                print(f'Set {backbone_name} backbone (height, width) to {mdl_hw}')
+                backbone_cfg.in_res_hw = mdl_hw
             else:
                 print(f'{backbone_name=} not available')
                 raise NotImplementedError

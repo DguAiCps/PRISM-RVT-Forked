@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+  - snn_default
+
+model:
+  backbone:
+    embed_dim: 32
+  fpn:
+    depth: 0.33

@@ -21,7 +21,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelSummary
 from pytorch_lightning.strategies import DDPStrategy
 
-from callbacks.custom import get_ckpt_callback, get_viz_callback
+from callbacks.custom import get_ckpt_callback, get_step_ckpt_callback, get_viz_callback
 from callbacks.gradflow import GradFlowLogCallback
 from config.modifier import dynamically_modify_train_config
 from data.utils.types import DatasetSamplingMode
@@ -93,6 +93,9 @@ def main(config: DictConfig):
     # ---------------------
     callbacks = list()
     callbacks.append(get_ckpt_callback(config))
+    step_ckpt = get_step_ckpt_callback(config)
+    if step_ckpt is not None:
+        callbacks.append(step_ckpt)
     callbacks.append(GradFlowLogCallback(config.logging.train.log_model_every_n_steps))
     if config.training.lr_scheduler.use:
         callbacks.append(LearningRateMonitor(logging_interval='step'))

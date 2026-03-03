@@ -31,6 +31,7 @@ hardware:
   dist_backend: "nccl"
 logging:
   ckpt_every_n_epochs: 1
+  ckpt_every_n_train_steps: null  # Optional[int] - save checkpoint every N training steps
   train:
     metrics:
       compute: false

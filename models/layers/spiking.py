@@ -39,8 +39,11 @@ class LIFNeuron(nn.Module):
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
                  threshold: float = 1.0,
-                 alpha: float = 2.0):
+                 alpha: float = 2.0,
+                 reset_mechanism: str = 'subtract'):
         super().__init__()
+        assert reset_mechanism in ('subtract', 'zero'), \
+            f"reset_mechanism must be 'subtract' or 'zero', got '{reset_mechanism}'"
         beta_tensor = torch.tensor(beta_init)
         if learn_beta:
             self.beta = nn.Parameter(beta_tensor)
@@ -48,6 +51,7 @@ class LIFNeuron(nn.Module):
             self.register_buffer('beta', beta_tensor)
         self.threshold = threshold
         self.alpha = alpha
+        self.reset_mechanism = reset_mechanism
 
     def forward(self,
                 cur: torch.Tensor,
@@ -64,8 +68,11 @@ class LIFNeuron(nn.Module):
         # Spike with ATan surrogate gradient
         spike = _atan_surrogate(mem - self.threshold, self.alpha)
 
-        # Reset by subtraction (detach so reset path carries no gradient)
-        mem = mem - spike.detach() * self.threshold
+        # Reset (detach so reset path carries no gradient)
+        if self.reset_mechanism == 'subtract':
+            mem = mem - spike.detach() * self.threshold
+        else:  # 'zero'
+            mem = mem * (1 - spike.detach())
 
         return spike, mem
 

@@ -103,6 +103,7 @@ class CGRAWindowAttention(nn.Module):
         num_heads: int,
         attn_scale: float = 0.125,
         output_scale: float = 0.25,
+        use_rel_pos_bias: bool = True,
         snn_cfg: Optional[DictConfig] = None,
     ):
         super().__init__()
@@ -113,6 +114,7 @@ class CGRAWindowAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.attn_scale = attn_scale
         self.output_scale = output_scale
+        self.use_rel_pos_bias = use_rel_pos_bias
         self.N = window_size[0] * window_size[1]  # tokens per window
 
         beta_init = snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5
@@ -151,22 +153,23 @@ class CGRAWindowAttention(nn.Module):
         self.bn_out = BNForTokens(dim)
         self.lif_out = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
 
-        # Relative position bias table
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
-        )
-        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        # Relative position bias table (optional)
+        if use_rel_pos_bias:
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+            )
+            trunc_normal_(self.relative_position_bias_table, std=0.02)
 
-        coords_h = torch.arange(window_size[0])
-        coords_w = torch.arange(window_size[1])
-        coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
-        coords_flat = coords.flatten(1)
-        relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
-        relative_coords[:, :, 0] += window_size[0] - 1
-        relative_coords[:, :, 1] += window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * window_size[1] - 1
-        self.register_buffer('relative_position_index', relative_coords.sum(-1))
+            coords_h = torch.arange(window_size[0])
+            coords_w = torch.arange(window_size[1])
+            coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing='ij'))
+            coords_flat = coords.flatten(1)
+            relative_coords = coords_flat[:, :, None] - coords_flat[:, None, :]
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+            relative_coords[:, :, 0] += window_size[0] - 1
+            relative_coords[:, :, 1] += window_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * window_size[1] - 1
+            self.register_buffer('relative_position_index', relative_coords.sum(-1))
 
     def _get_rel_pos_bias(self) -> torch.Tensor:
         """Returns (num_heads, N, N) relative position bias."""
@@ -239,8 +242,9 @@ class CGRAWindowAttention(nn.Module):
         # Coincidence gate: Q @ K^T (always >= 0 since spikes are non-negative)
         gate = (q @ k.transpose(-2, -1)) * self.attn_scale  # (BnW, H, N, N)
 
-        # Add relative position bias
-        gate = gate + self._get_rel_pos_bias().unsqueeze(0)
+        # Add relative position bias (optional)
+        if self.use_rel_pos_bias:
+            gate = gate + self._get_rel_pos_bias().unsqueeze(0)
 
         # Apply shifted-window mask (zero invalid pairs before LIF)
         if mask is not None:
@@ -401,6 +405,7 @@ class SpikingSwinBlock(nn.Module):
         mlp_ratio: float = 4.0,
         attn_scale: float = 0.125,
         output_scale: float = 0.25,
+        use_rel_pos_bias: bool = True,
         snn_cfg: Optional[DictConfig] = None,
     ):
         super().__init__()
@@ -421,7 +426,8 @@ class SpikingSwinBlock(nn.Module):
 
         self.attn = CGRAWindowAttention(
             dim=dim, window_size=attn_window, num_heads=num_heads,
-            attn_scale=attn_scale, output_scale=output_scale, snn_cfg=snn_cfg,
+            attn_scale=attn_scale, output_scale=output_scale,
+            use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
         )
         self.mlp = SpikingMLP2d(dim=dim, mlp_ratio=mlp_ratio, snn_cfg=snn_cfg)
 
@@ -508,6 +514,7 @@ class SpikingSwinStage(nn.Module):
         attn_scale: float = 0.125,
         output_scale: float = 0.25,
         downsample: bool = True,
+        use_rel_pos_bias: bool = True,
         snn_cfg: Optional[DictConfig] = None,
     ):
         super().__init__()
@@ -520,7 +527,8 @@ class SpikingSwinStage(nn.Module):
             self.blocks.append(SpikingSwinBlock(
                 dim=dim, input_resolution=input_resolution, num_heads=num_heads,
                 window_size=window_size, shift_size=shift, mlp_ratio=mlp_ratio,
-                attn_scale=attn_scale, output_scale=output_scale, snn_cfg=snn_cfg,
+                attn_scale=attn_scale, output_scale=output_scale,
+                use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
             ))
 
         self.downsample = SpikingPatchMerging(dim, snn_cfg=snn_cfg) if downsample else None
@@ -620,6 +628,7 @@ class SNNSwinBackbone(BaseDetector):
         mlp_ratio = mdl_config.get('mlp_ratio', 4.0)
         attn_scale = mdl_config.get('attn_scale', 0.125)
         output_scale = mdl_config.get('output_scale', 0.25)
+        use_rel_pos_bias = mdl_config.get('use_rel_pos_bias', True)
         snn_cfg = mdl_config.snn
         in_res_hw = tuple(mdl_config.in_res_hw)
 
@@ -648,7 +657,8 @@ class SNNSwinBackbone(BaseDetector):
                 dim=dim, input_resolution=(H, W), depth=depths[i],
                 num_heads=num_heads[i], window_size=window_sizes[i],
                 mlp_ratio=mlp_ratio, attn_scale=attn_scale, output_scale=output_scale,
-                downsample=(i < num_stages - 1), snn_cfg=snn_cfg,
+                downsample=(i < num_stages - 1),
+                use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
             ))
             self.stage_dims.append(dim)
             self._strides.append(stride)

@@ -12,8 +12,9 @@ model:
     num_heads: [2, 4, 8, 8]
     window_sizes: [8, 8, 4, null]
     mlp_ratio: 4.0
-    attn_scale: 0.125
-    output_scale: 0.25
+    attn_scale: 1.0
+    output_scale: 1.0
+    use_rel_pos_bias: false
     snn:
       beta_init: 0.5
       learn_beta: true

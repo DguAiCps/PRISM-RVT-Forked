@@ -226,7 +226,10 @@ class WandbLogger(Logger):
     def _get_public_run(self):
         if self._public_run is None:
             experiment = self.experiment
-            runpath = experiment._entity + '/' + experiment._project + '/' + experiment._run_id
+            entity = getattr(experiment, '_entity', None) or experiment.entity
+            project = getattr(experiment, '_project', None) or experiment.project
+            run_id = getattr(experiment, '_run_id', None) or experiment.id
+            runpath = entity + '/' + project + '/' + run_id
             api = wandb.Api()
             self._public_run = api.run(path=runpath)
         return self._public_run

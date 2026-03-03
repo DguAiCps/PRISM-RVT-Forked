@@ -184,6 +184,16 @@ class SNNCNNBackbone(BaseDetector):
         """
         if prev_states is None:
             prev_states = [None] * self.num_stages
+        else:
+            # Truncated BPTT: detach membrane potentials from the previous timestep
+            # so that gradients do not flow between timesteps.  Each timestep is
+            # optimised independently while the membrane *values* still carry over,
+            # which is the standard training regime for spiking neural networks.
+            prev_states = [
+                [m.detach() if m is not None else None for m in stage_mems]
+                if stage_mems is not None else None
+                for stage_mems in prev_states
+            ]
 
         output: Dict[int, FeatureMap] = {}
         states: SpikingStates = []

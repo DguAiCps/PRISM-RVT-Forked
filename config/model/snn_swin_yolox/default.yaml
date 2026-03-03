@@ -15,6 +15,7 @@ model:
     attn_scale: 1.0
     output_scale: 1.0
     use_rel_pos_bias: false
+    output_stages: [2, 3, 4]
     snn:
       beta_init: 0.5
       learn_beta: true

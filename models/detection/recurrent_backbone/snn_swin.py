@@ -498,7 +498,7 @@ class SpikingSwinBlock(nn.Module):
 
 
 class SpikingSwinStage(nn.Module):
-    """One stage: N blocks + optional patch merging + readout LIF.
+    """One stage: N blocks + optional patch merging + optional readout LIF.
 
     State: flat list of all membrane tensors in the stage.
     """
@@ -514,12 +514,14 @@ class SpikingSwinStage(nn.Module):
         attn_scale: float = 0.125,
         output_scale: float = 0.25,
         downsample: bool = True,
+        has_readout: bool = True,
         use_rel_pos_bias: bool = True,
         snn_cfg: Optional[DictConfig] = None,
     ):
         super().__init__()
         self.depth = depth
         self.has_downsample = downsample
+        self.has_readout = has_readout
 
         self.blocks = nn.ModuleList()
         for i in range(depth):
@@ -534,18 +536,20 @@ class SpikingSwinStage(nn.Module):
         self.downsample = SpikingPatchMerging(dim, snn_cfg=snn_cfg) if downsample else None
 
         # Readout path: Conv1x1 + BN + LIF -> membrane for FPN
-        self.readout_conv = nn.Conv2d(dim, dim, 1, bias=False)
-        self.readout_bn = nn.BatchNorm2d(dim)
-        self.readout_lif = LIFNeuron(
-            beta_init=snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5,
-            learn_beta=snn_cfg.get('learn_beta', True) if snn_cfg else True,
-            threshold=snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0,
-        )
+        # Only created for stages whose output is consumed (e.g. by FPN).
+        if has_readout:
+            self.readout_conv = nn.Conv2d(dim, dim, 1, bias=False)
+            self.readout_bn = nn.BatchNorm2d(dim)
+            self.readout_lif = LIFNeuron(
+                beta_init=snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5,
+                learn_beta=snn_cfg.get('learn_beta', True) if snn_cfg else True,
+                threshold=snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0,
+            )
 
         # Compute state sizes
         self._block_states = SpikingSwinBlock.NUM_STATES  # 8
         self._merge_states = SpikingPatchMerging.NUM_STATES if downsample else 0  # 0 or 1
-        self._readout_states = 1
+        self._readout_states = 1 if has_readout else 0
         self.num_states = depth * self._block_states + self._merge_states + self._readout_states
 
     def forward(
@@ -553,14 +557,14 @@ class SpikingSwinStage(nn.Module):
         x: torch.Tensor,
         prev_state: Optional[SwinSubState],
         B: int,
-    ) -> Tuple[FeatureMap, torch.Tensor, SwinSubState]:
+    ) -> Tuple[Optional[FeatureMap], torch.Tensor, SwinSubState]:
         """
         Args:
             x: (B, C, H, W)
             prev_state: flat list of membrane tensors, or None.
             B: batch size.
         Returns:
-            readout_mem: (B, C, H, W) continuous membrane for FPN.
+            readout_mem: (B, C, H, W) continuous membrane for FPN, or None.
             x_out: (B, C', H', W') output for next stage (spike after merge, or spike).
             new_state: flat list of membrane tensors.
         """
@@ -578,9 +582,12 @@ class SpikingSwinStage(nn.Module):
             offset += self._block_states
 
         # --- Readout (membrane for FPN) ---
-        readout_prev = prev_state[offset + self._merge_states] if prev_state is not None else None
-        readout_cur = self.readout_bn(self.readout_conv(x))
-        _, readout_mem = self.readout_lif(readout_cur, readout_prev)
+        if self.has_readout:
+            readout_prev = prev_state[offset + self._merge_states] if prev_state is not None else None
+            readout_cur = self.readout_bn(self.readout_conv(x))
+            _, readout_mem = self.readout_lif(readout_cur, readout_prev)
+        else:
+            readout_mem = None
 
         # --- Downsample ---
         if self.downsample is not None:
@@ -588,7 +595,8 @@ class SpikingSwinStage(nn.Module):
             x, merge_mem = self.downsample(x, merge_prev)
             new_state.append(merge_mem)
 
-        new_state.append(readout_mem)
+        if readout_mem is not None:
+            new_state.append(readout_mem)
 
         return readout_mem, x, new_state
 
@@ -629,6 +637,7 @@ class SNNSwinBackbone(BaseDetector):
         attn_scale = mdl_config.get('attn_scale', 0.125)
         output_scale = mdl_config.get('output_scale', 0.25)
         use_rel_pos_bias = mdl_config.get('use_rel_pos_bias', True)
+        output_stages = set(mdl_config.get('output_stages', [1, 2, 3, 4]))
         snn_cfg = mdl_config.snn
         in_res_hw = tuple(mdl_config.in_res_hw)
 
@@ -658,6 +667,7 @@ class SNNSwinBackbone(BaseDetector):
                 num_heads=num_heads[i], window_size=window_sizes[i],
                 mlp_ratio=mlp_ratio, attn_scale=attn_scale, output_scale=output_scale,
                 downsample=(i < num_stages - 1),
+                has_readout=((i + 1) in output_stages),
                 use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
             ))
             self.stage_dims.append(dim)
@@ -714,7 +724,8 @@ class SNNSwinBackbone(BaseDetector):
 
         for i, stage in enumerate(self.stages):
             readout_mem, x, stage_state = stage(x, prev_states[i + 1], B)
-            output[i + 1] = readout_mem
+            if readout_mem is not None:
+                output[i + 1] = readout_mem
             states.append(stage_state)
 
         return output, states

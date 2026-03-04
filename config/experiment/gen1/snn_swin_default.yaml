@@ -14,7 +14,7 @@ training:
     div_factor: 20
     final_div_factor: 10000
 logging:
-  ckpt_every_n_train_steps: 5000
+  ckpt_every_n_train_steps: 500
 validation:
   val_check_interval: null
   check_val_every_n_epoch: 1

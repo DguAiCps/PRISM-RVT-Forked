@@ -149,7 +149,7 @@ class WandbLogger(Logger):
         metrics = _add_prefix(metrics, self._prefix, self.LOGGER_JOIN_CHAR)
         if step is not None:
             self.add_step_metric(metrics, step)
-            self.experiment.log({**metrics}, step=step)
+            self.experiment.log({**metrics}, step=step, commit=False)
         else:
             self.experiment.log(metrics)
 
@@ -248,7 +248,9 @@ class WandbLogger(Logger):
             checkpoint_callback.best_model_path: checkpoint_callback.best_model_score,
             **checkpoint_callback.best_k_models,
         }
-        assert len(checkpoints) <= max(checkpoint_callback.save_top_k, 0)
+        # save_top_k=-1 means "save all checkpoints" — skip count assertion
+        if checkpoint_callback.save_top_k >= 0:
+            assert len(checkpoints) <= checkpoint_callback.save_top_k
 
         if save_last:
             last_model_path = Path(checkpoint_callback.last_model_path)

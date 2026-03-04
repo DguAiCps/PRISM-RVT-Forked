@@ -711,9 +711,6 @@ class SNNSwinBackbone(BaseDetector):
 
         if prev_states is None:
             prev_states = [None] * (1 + self.num_stages)
-        else:
-            # Truncated BPTT: detach all membranes from previous timestep graph
-            prev_states = RNNStates.recursive_detach(prev_states)
 
         # Patch embedding
         x, embed_state = self.patch_embed(x, prev_states[0])

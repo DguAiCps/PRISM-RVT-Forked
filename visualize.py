@@ -13,12 +13,20 @@ python visualize.py dataset=gen1 dataset.path=/path/to/gen1 \
     batch_size.eval=1 hardware.num_workers.eval=0 \
     +data_only=true +save_video=true
 
+# Attention visualization (heatmap overlay of what the model attends to):
+python visualize.py dataset=gen1 +model/snn_swin_yolox=default \
+    'checkpoint="/path/to/ckpt.ckpt"' dataset.path=/path/to/gen1 \
+    hardware.gpus=0 batch_size.eval=1 hardware.num_workers.eval=0 \
+    +attn_vis=true +save_video=true +attn_stage=2
+
 Optional Hydra overrides:
     +save_video=true        Save an MP4 video in addition to frames
     +max_frames=500         Stop after N frames (default: unlimited)
     +output_dir=./viz_out   Custom output directory
     +fps=20                 Video FPS (default: 20)
     +data_only=true         Skip model, just visualize data + GT labels
+    +attn_vis=true          Overlay attention heatmaps on event frames
+    +attn_stage=2           Which stage to visualize (1-4, default: 2)
 """
 import os
 
@@ -58,6 +66,168 @@ from utils.evaluation.prophesee.visualize.vis_utils import (
 )
 from utils.padding import InputPadderFromShape
 from modules.utils.detection import RNNStates
+from models.detection.recurrent_backbone.snn_swin import (
+    CGRAWindowAttention, window_reverse,
+)
+
+
+class AttentionCaptureHook:
+    """Forward hook that captures attention maps from CGRAWindowAttention."""
+
+    def __init__(self):
+        self.attn_spikes = []   # binary attention: list of (BnW, H_heads, N, N)
+        self.cell_mems = []     # cell membrane: list of (BnW, H_heads, N, N)
+        self.metadata = []      # (B, nW, N, H_heads, window_size, H, W, shift_size)
+
+    def clear(self):
+        self.attn_spikes.clear()
+        self.cell_mems.clear()
+        self.metadata.clear()
+
+    def hook_fn(self, module, args, output):
+        """Capture intermediate attention data via a wrapper around forward."""
+        # output is (out, new_mems) from CGRAWindowAttention.forward
+        # We can't directly access intermediates from hook, so we use a modified approach
+        pass
+
+
+def register_attn_hooks(backbone, target_stage: int):
+    """Register hooks on CGRAWindowAttention modules in the target stage.
+
+    Instead of standard hooks (which can't access intermediates), we
+    monkey-patch the forward method to store attention maps.
+    """
+    capture = AttentionCaptureHook()
+    stage = backbone.stages[target_stage - 1]  # 1-indexed
+
+    for blk_idx, blk in enumerate(stage.blocks):
+        attn_module = blk.attn
+        original_forward = attn_module.forward
+
+        def make_wrapper(orig_fwd, blk_ref):
+            def wrapped_forward(x, prev_mems, B, mask=None):
+                out, new_mems = orig_fwd(x, prev_mems, B, mask)
+
+                # Recompute attention spike for capture (cheap since spikes are in new_mems)
+                # cell_mem is new_mems[3]: (B, nW*H_heads, N, N)
+                BnW = x.shape[0]
+                N = attn_module.N
+                H_heads = attn_module.num_heads
+                nW = BnW // B
+
+                cell_mem = new_mems[3]  # (B, nW*H_heads, N, N)
+                cell_mem_reshaped = cell_mem.reshape(BnW, H_heads, N, N)
+
+                # cell_spike: threshold at 1.0 (same as attn_cell_lif threshold)
+                cell_spike = (cell_mem_reshaped > 0).float()
+
+                capture.attn_spikes.append(cell_spike.detach().cpu())
+                capture.cell_mems.append(cell_mem_reshaped.detach().cpu())
+                capture.metadata.append({
+                    'B': B, 'nW': nW, 'N': N, 'H_heads': H_heads,
+                    'window_size': blk_ref.window_size,
+                    'input_resolution': blk_ref.input_resolution,
+                    'shift_size': blk_ref.shift_size,
+                    'global_attn': blk_ref.global_attn,
+                })
+                return out, new_mems
+            return wrapped_forward
+
+        attn_module.forward = make_wrapper(original_forward, blk)
+
+    return capture
+
+
+def attn_to_spatial_map(capture: AttentionCaptureHook, batch_idx: int = 0) -> np.ndarray:
+    """Convert captured attention data to a spatial heatmap.
+
+    For each block, we compute the average attention each spatial position
+    receives (mean over heads, mean over query tokens of how much each
+    key token is attended to). Then average across blocks.
+
+    Returns: (H, W) float32 heatmap normalized to [0, 1].
+    """
+    spatial_maps = []
+
+    for blk_i in range(len(capture.cell_mems)):
+        meta = capture.metadata[blk_i]
+        B = meta['B']
+        nW = meta['nW']
+        N = meta['N']
+        H_heads = meta['H_heads']
+        ws = meta['window_size']
+        H, W = meta['input_resolution']
+        shift = meta['shift_size']
+        global_attn = meta['global_attn']
+
+        # cell_mem: (BnW, H_heads, N, N) — use membrane potential as attention intensity
+        cell_mem = capture.cell_mems[blk_i]
+
+        # Select batch item
+        BnW = B * nW
+        # Reshape to (B, nW, H_heads, N, N)
+        mem = cell_mem.reshape(B, nW, H_heads, N, N)
+        mem = mem[batch_idx]  # (nW, H_heads, N, N)
+
+        # Average over heads: (nW, N, N)
+        mem_avg = mem.mean(dim=1)
+
+        # For each key token, sum attention it receives from all queries: (nW, N)
+        key_importance = mem_avg.mean(dim=1)  # mean over query dim -> (nW, N)
+
+        if global_attn:
+            # N = H*W, single window covering the whole feature map
+            spatial = key_importance[0].reshape(H, W)
+        else:
+            # Reconstruct spatial map from windows
+            # key_importance: (nW, N) -> (nW, ws, ws)
+            key_2d = key_importance.reshape(nW, ws, ws)
+            # Add channel dim for window_reverse: (nW, ws, ws, 1)
+            key_4d = key_2d.unsqueeze(-1)
+            # (B=1)*nW windows -> (1, H, W, 1)
+            spatial_4d = window_reverse(key_4d, ws, H, W)
+            spatial = spatial_4d[0, :, :, 0]  # (H, W)
+
+            # Undo shift
+            if shift > 0:
+                spatial = torch.roll(spatial, shifts=(shift, shift), dims=(0, 1))
+
+        spatial_maps.append(spatial.numpy())
+
+    # Average across blocks
+    combined = np.mean(spatial_maps, axis=0)
+
+    # Normalize to [0, 1]
+    vmin, vmax = combined.min(), combined.max()
+    if vmax - vmin > 1e-8:
+        combined = (combined - vmin) / (vmax - vmin)
+    else:
+        combined = np.zeros_like(combined)
+
+    return combined.astype(np.float32)
+
+
+def overlay_heatmap(img: np.ndarray, heatmap: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """Overlay a heatmap on an RGB image.
+
+    Args:
+        img: (H_img, W_img, 3) uint8 RGB image.
+        heatmap: (H_feat, W_feat) float32 in [0, 1].
+        alpha: blending factor.
+    Returns:
+        (H_img, W_img, 3) uint8 RGB image with heatmap overlay.
+    """
+    h, w = img.shape[:2]
+    # Resize heatmap to image size
+    heatmap_resized = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_LINEAR)
+    # Apply colormap (JET: blue=cold, red=hot)
+    heatmap_uint8 = (heatmap_resized * 255).astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    # Blend
+    blended = (alpha * heatmap_rgb.astype(np.float32) +
+               (1 - alpha) * img.astype(np.float32))
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def ev_repr_to_img(x: np.ndarray) -> np.ndarray:
@@ -99,6 +269,8 @@ def main(config: DictConfig):
     max_frames = int(config.get('max_frames', 0))  # 0 = unlimited
     output_dir = str(config.get('output_dir', './visualization_output'))
     fps = int(config.get('fps', 20))
+    attn_vis = bool(config.get('attn_vis', False))
+    attn_stage = int(config.get('attn_stage', 2))  # 1-indexed
 
     # In data_only mode, fill in mandatory model config placeholders
     if data_only:
@@ -166,6 +338,7 @@ def main(config: DictConfig):
     mdl_config = None
     input_padder = None
     rnn_states = None
+    attn_capture = None
     if not data_only:
         ckpt_path = Path(config.checkpoint)
         module = DetectionModule.load_from_checkpoint(str(ckpt_path), full_config=config)
@@ -176,6 +349,10 @@ def main(config: DictConfig):
         in_res_hw = tuple(mdl_config.backbone.in_res_hw)
         input_padder = InputPadderFromShape(desired_hw=in_res_hw)
         rnn_states = RNNStates()
+
+        if attn_vis:
+            attn_capture = register_attn_hooks(mdl.backbone, target_stage=attn_stage)
+            print(f'Attention visualization enabled for stage {attn_stage}')
 
     # ---- Output directory ----
     mode_str = 'data_only' if data_only else 'detection'
@@ -246,6 +423,13 @@ def main(config: DictConfig):
                     # Empty bbox array for draw_bboxes_bbv (ensures consistent scaling)
                     empty_boxes = np.zeros((0,), dtype=BBOX_DTYPE)
 
+                    # Compute attention heatmap if enabled
+                    attn_heatmaps = {}
+                    if attn_capture is not None and len(attn_capture.cell_mems) > 0:
+                        for bi in range(batch_size):
+                            attn_heatmaps[bi] = attn_to_spatial_map(attn_capture, batch_idx=bi)
+                        attn_capture.clear()
+
                     for bi in range(batch_size):
                         ev_np = ev_tensor_sequence[tidx][bi].cpu().numpy()
                         ev_img = ev_repr_to_img(ev_np)
@@ -274,16 +458,35 @@ def main(config: DictConfig):
                             gt_proph = empty_boxes
                         label_img = draw_bboxes_bbv(ev_img.copy(), gt_proph, labelmap=label_map)
 
-                        # Side-by-side
-                        merged = np.concatenate([pred_img, label_img], axis=1)
-                        header_h = 30
-                        header = np.zeros((header_h, merged.shape[1], 3), dtype=np.uint8)
-                        mid = merged.shape[1] // 2
-                        cv2.putText(header, 'Predictions', (10, 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                        gt_text = 'Ground Truth' if (has_gt and bi in valid_batch_indices) else 'Ground Truth (N/A)'
-                        cv2.putText(header, gt_text, (mid + 10, 20),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        # Attention heatmap overlay
+                        if bi in attn_heatmaps:
+                            attn_img = overlay_heatmap(ev_img, attn_heatmaps[bi], alpha=0.6)
+                            # Scale attn_img to match pred/label image size
+                            attn_img = cv2.resize(attn_img, (pred_img.shape[1], pred_img.shape[0]),
+                                                  interpolation=cv2.INTER_LINEAR)
+                            # 3-panel: attention | predictions | ground truth
+                            merged = np.concatenate([attn_img, pred_img, label_img], axis=1)
+                            header_h = 30
+                            header = np.zeros((header_h, merged.shape[1], 3), dtype=np.uint8)
+                            panel_w = merged.shape[1] // 3
+                            cv2.putText(header, f'Attention (stage {attn_stage})', (10, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                            cv2.putText(header, 'Predictions', (panel_w + 10, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                            gt_text = 'Ground Truth' if (has_gt and bi in valid_batch_indices) else 'GT (N/A)'
+                            cv2.putText(header, gt_text, (2 * panel_w + 10, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        else:
+                            # 2-panel: predictions | ground truth
+                            merged = np.concatenate([pred_img, label_img], axis=1)
+                            header_h = 30
+                            header = np.zeros((header_h, merged.shape[1], 3), dtype=np.uint8)
+                            mid = merged.shape[1] // 2
+                            cv2.putText(header, 'Predictions', (10, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                            gt_text = 'Ground Truth' if (has_gt and bi in valid_batch_indices) else 'GT (N/A)'
+                            cv2.putText(header, gt_text, (mid + 10, 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                         merged = np.concatenate([header, merged], axis=0)
 
                         write_frame(merged, frame_idx, frames_path, video_writer,

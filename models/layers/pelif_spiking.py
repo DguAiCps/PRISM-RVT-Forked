@@ -20,6 +20,17 @@ def _atan_surrogate(mem_shift: torch.Tensor, alpha: float = 2.0) -> torch.Tensor
     return smooth + (binary - smooth).detach()
 
 
+def _triangle_surrogate(mem_shift: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
+    """Spike function with Triangle surrogate gradient (matching 1D PeLIF).
+
+    Forward: binary Heaviside.
+    Backward: derivative of piecewise linear proxy = triangle function.
+    """
+    binary = (mem_shift > 0).float()
+    proxy = torch.clamp(0.5 + mem_shift / (2.0 * gamma), 0.0, 1.0)
+    return proxy + (binary - proxy).detach()
+
+
 class PeLIFNeuron2d(nn.Module):
     """Periodic LIF neuron for 2D feature maps.
 
@@ -33,7 +44,9 @@ class PeLIFNeuron2d(nn.Module):
         beta_init: membrane decay factor
         learn_beta: whether beta is learnable
         threshold: spike threshold
-        alpha: surrogate gradient sharpness
+        surrogate: surrogate gradient type ('atan' or 'triangle')
+        surrogate_alpha: sharpness for atan surrogate
+        surrogate_gamma: width for triangle surrogate
     """
 
     def __init__(self,
@@ -42,13 +55,25 @@ class PeLIFNeuron2d(nn.Module):
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
                  threshold: float = 1.0,
-                 alpha: float = 2.0):
+                 surrogate: str = 'triangle',
+                 surrogate_alpha: float = 2.0,
+                 surrogate_gamma: float = 1.0):
         super().__init__()
         self.channels = channels
         self.periods = list(periods)
         self.num_groups = len(self.periods)
         self.threshold = threshold
-        self.alpha = alpha
+        self.surrogate_type = surrogate
+        self.surrogate_alpha = surrogate_alpha
+        self.surrogate_gamma = surrogate_gamma
+
+        # Select surrogate function
+        if surrogate == 'atan':
+            self._spike_fn = lambda x: _atan_surrogate(x, self.surrogate_alpha)
+        elif surrogate == 'triangle':
+            self._spike_fn = lambda x: _triangle_surrogate(x, self.surrogate_gamma)
+        else:
+            raise ValueError(f"Unknown surrogate: {surrogate}. Use 'atan' or 'triangle'.")
 
         # Divide channels evenly among period groups
         base = channels // self.num_groups
@@ -100,7 +125,7 @@ class PeLIFNeuron2d(nn.Module):
             end = self.group_offsets[g + 1]
 
             if t % period == 0:
-                s_g = _atan_surrogate(mem[:, off:end] - self.threshold, self.alpha)
+                s_g = self._spike_fn(mem[:, off:end] - self.threshold)
                 # Soft reset (not detached, matching 1D PeLIF)
                 mem = mem.clone()
                 mem[:, off:end] = mem[:, off:end] - s_g * self.threshold

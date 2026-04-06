@@ -38,13 +38,15 @@ class PeLIFTemporalBlock(nn.Module):
                  periods: Tuple[int, ...] = (1, 2, 4, 8),
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
-                 threshold: float = 1.0):
+                 threshold: float = 1.0,
+                 surrogate: str = 'triangle'):
         super().__init__()
         self.pelif = PeLIFNeuron2d(
             channels=channels,
             periods=periods,
             beta_init=beta_init,
             learn_beta=learn_beta,
+            surrogate=surrogate,
             threshold=threshold,
         )
         # 1x1 Conv recurrence (W_rec equivalent)
@@ -138,6 +140,7 @@ class PeLIFCNNStage(nn.Module):
             channels=dim_out,
             periods=periods,
             beta_init=pelif_cfg.get('beta_init', 0.9),
+            surrogate=pelif_cfg.get('surrogate', 'triangle'),
             learn_beta=pelif_cfg.get('learn_beta', True),
             threshold=pelif_cfg.get('threshold', 1.0),
         )

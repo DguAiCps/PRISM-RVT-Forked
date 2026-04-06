@@ -24,6 +24,7 @@ model:
       beta_init: 0.9
       learn_beta: true
       threshold: 1.0
+      surrogate: triangle
   fpn:
     name: PAFPN
     compile: { enable: false, args: { mode: reduce-overhead } }

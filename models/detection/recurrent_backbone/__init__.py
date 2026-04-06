@@ -3,6 +3,7 @@ from omegaconf import DictConfig
 from .maxvit_rnn import RNNDetector as MaxViTRNNDetector
 from .snn_cnn import SNNCNNBackbone
 from .snn_swin import SNNSwinBackbone
+from .pelif_cnn import PeLIFCNNBackbone
 
 
 def build_recurrent_backbone(backbone_cfg: DictConfig):
@@ -13,5 +14,7 @@ def build_recurrent_backbone(backbone_cfg: DictConfig):
         return SNNCNNBackbone(backbone_cfg)
     elif name == 'SNNSwin':
         return SNNSwinBackbone(backbone_cfg)
+    elif name == 'PeLIFCNN':
+        return PeLIFCNNBackbone(backbone_cfg)
     else:
         raise NotImplementedError

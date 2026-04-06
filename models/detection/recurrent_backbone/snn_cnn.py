@@ -34,26 +34,14 @@ class SNNCNNStage(nn.Module):
         super().__init__()
         self.num_conv_layers = num_conv_layers
 
-        beta_init = snn_cfg.get('beta_init', 0.9)
-        learn_beta = snn_cfg.get('learn_beta', True)
-        threshold = snn_cfg.get('threshold', 1.0)
-        reset_mechanism = snn_cfg.get('reset_mechanism', 'subtract')
-        channelwise_beta = snn_cfg.get('channelwise_beta', False)
-        beta_spread = snn_cfg.get('beta_spread', 0.0)
-        learn_reset = snn_cfg.get('learn_reset', False)
-        reset_ratio_init = snn_cfg.get('reset_ratio_init', 0.7)
-        reset_spread = snn_cfg.get('reset_spread', 0.0)
-
         snn_kwargs = dict(
-            beta_init=beta_init,
-            learn_beta=learn_beta,
-            threshold=threshold,
-            reset_mechanism=reset_mechanism,
-            channelwise_beta=channelwise_beta,
-            beta_spread=beta_spread,
-            learn_reset=learn_reset,
-            reset_ratio_init=reset_ratio_init,
-            reset_spread=reset_spread,
+            beta_init=snn_cfg.get('beta_init', 0.9),
+            learn_beta=snn_cfg.get('learn_beta', True),
+            threshold=snn_cfg.get('threshold', 1.0),
+            reset_mechanism=snn_cfg.get('reset_mechanism', 'subtract'),
+            channelwise_beta=snn_cfg.get('channelwise_beta', False),
+            beta_spread=snn_cfg.get('beta_spread', 0.0),
+            surrogate=snn_cfg.get('surrogate', 'triangle'),
         )
 
         # First layer: spatial downsampling

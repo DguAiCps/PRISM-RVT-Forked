@@ -21,13 +21,22 @@ def _atan_surrogate(mem_shift: torch.Tensor, alpha: float = 2.0) -> torch.Tensor
 
 
 def _triangle_surrogate(mem_shift: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
-    """Spike function with Triangle surrogate gradient (matching 1D PeLIF).
+    """Spike function with peaked Triangle surrogate gradient (matching 1D PeLIF).
 
     Forward: binary Heaviside.
-    Backward: derivative of piecewise linear proxy = triangle function.
+    Backward: (1/gamma^2) * max(gamma - |x|, 0)  — peaked triangle.
+
+    Uses a quadratic proxy active only within [-gamma, gamma], masked to zero outside.
     """
     binary = (mem_shift > 0).float()
-    proxy = torch.clamp(0.5 + mem_shift / (2.0 * gamma), 0.0, 1.0)
+    # Quadratic proxy whose derivative = (1/γ²)(γ - |x|) within [-γ, γ]
+    raw_proxy = (1.0 / gamma ** 2) * (
+        gamma * mem_shift - mem_shift * mem_shift.abs() / 2.0 + gamma ** 2 / 2.0
+    )
+    # Mask: zero gradient outside [-γ, γ]
+    mask = (mem_shift.abs() < gamma).float()
+    proxy = raw_proxy * mask + 0.5 * (1.0 - mask)  # 0.5 outside (no gradient)
+    proxy = proxy.clamp(0.0, 1.0)
     return proxy + (binary - proxy).detach()
 
 

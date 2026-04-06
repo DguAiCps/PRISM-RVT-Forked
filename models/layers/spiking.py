@@ -1,37 +1,17 @@
 """Spiking neuron layers for SNN backbone."""
-import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-
-def _atan_surrogate(mem_shift: torch.Tensor, alpha: float = 2.0) -> torch.Tensor:
-    """Spike function with ATan surrogate gradient (pure PyTorch, no custom autograd).
-
-    Forward: Heaviside step  S = (mem_shift > 0).float()
-    Backward: dS/d(mem_shift) = alpha/2 / (1 + (pi/2 * alpha * mem_shift)^2)
-
-    Uses the straight-through estimator trick so that the forward output is
-    binary but gradients flow through the smooth arctan surrogate.
-    """
-    smooth = (1.0 / math.pi) * torch.atan(
-        (math.pi * alpha / 2.0) * mem_shift
-    ) + 0.5
-    binary = (mem_shift > 0).float()
-    # Forward = binary,  Backward = d(smooth)/d(mem_shift)
-    return smooth + (binary - smooth).detach()
+from .pelif_spiking import _atan_surrogate, _triangle_surrogate
 
 
 class LIFNeuron(nn.Module):
-    """Leaky Integrate-and-Fire neuron (pure PyTorch, replaces snntorch.Leaky).
-
-    Implements the same dynamics as ``snntorch.Leaky`` with
-    ``reset_mechanism='subtract'`` but uses only standard PyTorch ops,
-    avoiding the in-place ``pow_()`` in snntorch's ATan surrogate backward.
+    """Leaky Integrate-and-Fire neuron (pure PyTorch).
 
     Membrane update:  V[t] = beta * V[t-1] + I[t]
-    Spike:            S[t] = Heaviside(V[t] - threshold)   (ATan surrogate grad)
+    Spike:            S[t] = Heaviside(V[t] - threshold)   (surrogate grad)
     Reset:            V[t] = V[t] - S[t].detach() * threshold
     """
 
@@ -39,13 +19,12 @@ class LIFNeuron(nn.Module):
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
                  threshold: float = 1.0,
-                 alpha: float = 2.0,
                  reset_mechanism: str = 'subtract',
                  channels: Optional[int] = None,
                  beta_spread: float = 0.0,
-                 learn_reset: bool = False,
-                 reset_ratio_init: float = 0.7,
-                 reset_spread: float = 0.0):
+                 surrogate: str = 'triangle',
+                 surrogate_alpha: float = 2.0,
+                 surrogate_gamma: float = 1.0):
         super().__init__()
         assert reset_mechanism in ('subtract', 'zero'), \
             f"reset_mechanism must be 'subtract' or 'zero', got '{reset_mechanism}'"
@@ -63,20 +42,15 @@ class LIFNeuron(nn.Module):
             self.register_buffer('beta', beta_tensor)
 
         self.threshold = threshold
-        self.alpha = alpha
         self.reset_mechanism = reset_mechanism
 
-        # Learnable reset ratio: reset_amount = reset_ratio * threshold
-        self.learn_reset = learn_reset
-        if learn_reset:
-            if channels is not None:
-                reset_tensor = torch.empty(1, channels, 1, 1)
-                nn.init.uniform_(reset_tensor, reset_ratio_init - reset_spread,
-                                 reset_ratio_init + reset_spread)
-                reset_tensor.clamp_(0.0, 1.0)
-            else:
-                reset_tensor = torch.tensor(reset_ratio_init)
-            self.reset_ratio = nn.Parameter(reset_tensor)
+        # Surrogate function
+        if surrogate == 'atan':
+            self._spike_fn = lambda x: _atan_surrogate(x, surrogate_alpha)
+        elif surrogate == 'triangle':
+            self._spike_fn = lambda x: _triangle_surrogate(x, surrogate_gamma)
+        else:
+            raise ValueError(f"Unknown surrogate: {surrogate}. Use 'atan' or 'triangle'.")
 
     def forward(self,
                 cur: torch.Tensor,
@@ -90,18 +64,14 @@ class LIFNeuron(nn.Module):
         # Leaky integration
         mem = beta * mem + cur
 
-        # Spike with ATan surrogate gradient
-        spike = _atan_surrogate(mem - self.threshold, self.alpha)
+        # Spike with surrogate gradient
+        spike = self._spike_fn(mem - self.threshold)
 
-        # Reset (detach so reset path carries no gradient)
+        # Reset (not detached, matching PeLIF design)
         if self.reset_mechanism == 'subtract':
-            if self.learn_reset:
-                reset_amount = self.reset_ratio.clamp(0.0, 1.0) * self.threshold
-            else:
-                reset_amount = self.threshold
-            mem = mem - spike.detach() * reset_amount
+            mem = mem - spike * self.threshold
         else:  # 'zero'
-            mem = mem * (1 - spike.detach())
+            mem = mem * (1 - spike)
 
         return spike, mem
 
@@ -126,9 +96,7 @@ class SpikingConvBlock(nn.Module):
                  reset_mechanism: str = 'subtract',
                  channelwise_beta: bool = False,
                  beta_spread: float = 0.0,
-                 learn_reset: bool = False,
-                 reset_ratio_init: float = 0.7,
-                 reset_spread: float = 0.0):
+                 surrogate: str = 'triangle'):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=kernel_size,
@@ -142,9 +110,7 @@ class SpikingConvBlock(nn.Module):
             threshold=threshold,
             channels=out_channels if channelwise_beta else None,
             beta_spread=beta_spread,
-            learn_reset=learn_reset,
-            reset_ratio_init=reset_ratio_init,
-            reset_spread=reset_spread,
+            surrogate=surrogate,
         )
 
     def forward(self,

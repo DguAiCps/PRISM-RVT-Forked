@@ -172,7 +172,7 @@ class PeLIFCNNStage(nn.Module):
         # PeLIF block: temporal memory (receives LIF spike output)
         pelif_spike, pelif_mem, new_pelif_state = self.pelif_block(x, pelif_state, t)
 
-        return pelif_mem.clone(), pelif_spike, (new_lif_mems, new_pelif_state)
+        return pelif_mem, pelif_spike, (new_lif_mems, new_pelif_state)
 
 
 class PeLIFCNNBackbone(BaseDetector):

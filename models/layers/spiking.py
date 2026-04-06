@@ -40,18 +40,43 @@ class LIFNeuron(nn.Module):
                  learn_beta: bool = True,
                  threshold: float = 1.0,
                  alpha: float = 2.0,
-                 reset_mechanism: str = 'subtract'):
+                 reset_mechanism: str = 'subtract',
+                 channels: Optional[int] = None,
+                 beta_spread: float = 0.0,
+                 learn_reset: bool = False,
+                 reset_ratio_init: float = 0.7,
+                 reset_spread: float = 0.0):
         super().__init__()
         assert reset_mechanism in ('subtract', 'zero'), \
             f"reset_mechanism must be 'subtract' or 'zero', got '{reset_mechanism}'"
-        beta_tensor = torch.tensor(beta_init)
+
+        # Beta: per-channel if channels is set, otherwise scalar
+        if channels is not None:
+            beta_tensor = torch.empty(1, channels, 1, 1)
+            nn.init.uniform_(beta_tensor, beta_init - beta_spread, beta_init + beta_spread)
+            beta_tensor.clamp_(0.0, 1.0)
+        else:
+            beta_tensor = torch.tensor(beta_init)
         if learn_beta:
             self.beta = nn.Parameter(beta_tensor)
         else:
             self.register_buffer('beta', beta_tensor)
+
         self.threshold = threshold
         self.alpha = alpha
         self.reset_mechanism = reset_mechanism
+
+        # Learnable reset ratio: reset_amount = reset_ratio * threshold
+        self.learn_reset = learn_reset
+        if learn_reset:
+            if channels is not None:
+                reset_tensor = torch.empty(1, channels, 1, 1)
+                nn.init.uniform_(reset_tensor, reset_ratio_init - reset_spread,
+                                 reset_ratio_init + reset_spread)
+                reset_tensor.clamp_(0.0, 1.0)
+            else:
+                reset_tensor = torch.tensor(reset_ratio_init)
+            self.reset_ratio = nn.Parameter(reset_tensor)
 
     def forward(self,
                 cur: torch.Tensor,
@@ -70,7 +95,11 @@ class LIFNeuron(nn.Module):
 
         # Reset (detach so reset path carries no gradient)
         if self.reset_mechanism == 'subtract':
-            mem = mem - spike.detach() * self.threshold
+            if self.learn_reset:
+                reset_amount = self.reset_ratio.clamp(0.0, 1.0) * self.threshold
+            else:
+                reset_amount = self.threshold
+            mem = mem - spike.detach() * reset_amount
         else:  # 'zero'
             mem = mem * (1 - spike.detach())
 
@@ -94,7 +123,12 @@ class SpikingConvBlock(nn.Module):
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
                  threshold: float = 1.0,
-                 reset_mechanism: str = 'subtract'):
+                 reset_mechanism: str = 'subtract',
+                 channelwise_beta: bool = False,
+                 beta_spread: float = 0.0,
+                 learn_reset: bool = False,
+                 reset_ratio_init: float = 0.7,
+                 reset_spread: float = 0.0):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=kernel_size,
@@ -106,6 +140,11 @@ class SpikingConvBlock(nn.Module):
             beta_init=beta_init,
             learn_beta=learn_beta,
             threshold=threshold,
+            channels=out_channels if channelwise_beta else None,
+            beta_spread=beta_spread,
+            learn_reset=learn_reset,
+            reset_ratio_init=reset_ratio_init,
+            reset_spread=reset_spread,
         )
 
     def forward(self,

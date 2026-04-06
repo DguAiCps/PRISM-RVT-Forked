@@ -38,6 +38,23 @@ class SNNCNNStage(nn.Module):
         learn_beta = snn_cfg.get('learn_beta', True)
         threshold = snn_cfg.get('threshold', 1.0)
         reset_mechanism = snn_cfg.get('reset_mechanism', 'subtract')
+        channelwise_beta = snn_cfg.get('channelwise_beta', False)
+        beta_spread = snn_cfg.get('beta_spread', 0.0)
+        learn_reset = snn_cfg.get('learn_reset', False)
+        reset_ratio_init = snn_cfg.get('reset_ratio_init', 0.7)
+        reset_spread = snn_cfg.get('reset_spread', 0.0)
+
+        snn_kwargs = dict(
+            beta_init=beta_init,
+            learn_beta=learn_beta,
+            threshold=threshold,
+            reset_mechanism=reset_mechanism,
+            channelwise_beta=channelwise_beta,
+            beta_spread=beta_spread,
+            learn_reset=learn_reset,
+            reset_ratio_init=reset_ratio_init,
+            reset_spread=reset_spread,
+        )
 
         # First layer: spatial downsampling
         if spatial_downsample_factor == 4:
@@ -51,10 +68,7 @@ class SNNCNNStage(nn.Module):
             kernel_size=k,
             stride=spatial_downsample_factor,
             padding=p,
-            beta_init=beta_init,
-            learn_beta=learn_beta,
-            threshold=threshold,
-            reset_mechanism=reset_mechanism,
+            **snn_kwargs,
         )]
 
         # Additional same-resolution layers
@@ -65,10 +79,7 @@ class SNNCNNStage(nn.Module):
                 kernel_size=3,
                 stride=1,
                 padding=1,
-                beta_init=beta_init,
-                learn_beta=learn_beta,
-                threshold=threshold,
-                reset_mechanism=reset_mechanism,
+                **snn_kwargs,
             ))
 
         self.layers = nn.ModuleList(layers)
@@ -184,16 +195,6 @@ class SNNCNNBackbone(BaseDetector):
         """
         if prev_states is None:
             prev_states = [None] * self.num_stages
-        else:
-            # Truncated BPTT: detach membrane potentials from the previous timestep
-            # so that gradients do not flow between timesteps.  Each timestep is
-            # optimised independently while the membrane *values* still carry over,
-            # which is the standard training regime for spiking neural networks.
-            prev_states = [
-                [m.detach() if m is not None else None for m in stage_mems]
-                if stage_mems is not None else None
-                for stage_mems in prev_states
-            ]
 
         output: Dict[int, FeatureMap] = {}
         states: SpikingStates = []

@@ -4,24 +4,26 @@ defaults:
 
 model:
   backbone:
-    name: SNNCNN
+    name: SoftmaxSwin
     input_channels: 20
     enable_masking: false
-    embed_dim: 64
-    dim_multiplier: [1, 2, 4, 8]
-    num_conv_layers: [3, 3, 3, 3]
-    stem:
-      patch_size: 4
+    embed_dim: 40
+    depths: [2, 2, 2, 2]
+    num_heads: [2, 4, 8, 8]
+    window_sizes: [8, 8, 4, null]
+    mlp_ratio: 4.0
+    attn_drop: 0.0
+    proj_drop: 0.0
+    use_rel_pos_bias: false
+    output_stages: [2, 3, 4]
     snn:
       beta_init: 0.5
       learn_beta: true
       threshold: 1.0
       reset_mechanism: subtract
-      channelwise_beta: true
-      beta_spread: 0.3
-      learn_reset: true
-      reset_ratio_init: 0.7
-      reset_spread: 0.3
+      use_feedback: true
+      fb_beta_init: 0.9
+      fb_threshold: 0.25
   fpn:
     name: PAFPN
     compile:

@@ -13,7 +13,6 @@ model:
     window_sizes: [8, 8, 4, null]
     mlp_ratio: 4.0
     attn_scale: 0.125
-    output_scale: 0.25
     use_rel_pos_bias: false
     output_stages: [2, 3, 4]
     snn:
@@ -21,6 +20,9 @@ model:
       learn_beta: true
       threshold: 1.0
       reset_mechanism: subtract
+      use_feedback: true
+      fb_beta_init: 0.9
+      fb_threshold: 0.25
   fpn:
     name: PAFPN
     compile:

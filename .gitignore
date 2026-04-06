@@ -133,3 +133,4 @@ outputs/
 wandb/
 RVT/
 visualization_output/
+spike_diagnostics/

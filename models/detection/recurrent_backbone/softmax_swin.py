@@ -1,18 +1,18 @@
-"""SNN Swin Backbone: Spiking Swin Transformer with SSA Window Attention.
+"""SoftmaxSwin Backbone: Ablation replacing SSA with standard softmax attention.
 
-Hierarchical 4-stage backbone producing multi-scale feature maps for detection.
-Uses Spikformer-style Spiking Self-Attention (Q_spike @ K_spike^T as continuous
-attention weights) and Swin's shifted-window scheme. All LIF membranes persist
-across timesteps via explicit state passing compatible with RVT's RNNStates.
+All spiking components (patch embed, MLP, downsample, readout) are preserved.
+Only the attention Q/K/V projections and attention computation are changed to
+standard scaled dot-product attention with softmax normalization.
 
-Reference: Spikformer (Zhou et al., 2023) SSA module.
+This isolates one variable: unnormalized spike attention vs. softmax attention.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig
 from timm.layers import trunc_normal_
 
@@ -20,132 +20,62 @@ from data.utils.types import BackboneFeatures, FeatureMap
 from models.layers.spiking import LIFNeuron
 from modules.utils.detection import RNNStates
 from .base import BaseDetector
-
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
-SwinSubState = List[torch.Tensor]   # flat list of membrane tensors per module
-SwinStates = List[SwinSubState]     # [embed_state, stage0, stage1, stage2, stage3]
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-def window_partition(x: torch.Tensor, window_size: int) -> torch.Tensor:
-    """Partition (B, H, W, C) into (B*nW, Ws, Ws, C) windows."""
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-
-
-def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int) -> torch.Tensor:
-    """Reverse window_partition: (B*nW, Ws, Ws, C) -> (B, H, W, C)."""
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    return x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-
-
-def compute_sw_mask(
-    H: int, W: int, window_size: int, shift_size: int, device: torch.device | None = None,
-) -> torch.Tensor:
-    """Shifted-window attention mask. Returns (nW, N, N) with -100 for masked positions."""
-    img_mask = torch.zeros((1, H, W, 1), device=device)
-    h_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
-    w_slices = (slice(0, -window_size), slice(-window_size, -shift_size), slice(-shift_size, None))
-    cnt = 0
-    for h in h_slices:
-        for w in w_slices:
-            img_mask[:, h, w, :] = cnt
-            cnt += 1
-    mask_windows = window_partition(img_mask, window_size)           # (nW, Ws, Ws, 1)
-    mask_windows = mask_windows.view(-1, window_size * window_size)  # (nW, N)
-    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  # (nW, N, N)
-    return attn_mask.masked_fill(attn_mask != 0, -100.0).masked_fill(attn_mask == 0, 0.0)
+from .snn_swin import (
+    SwinSubState,
+    SwinStates,
+    window_partition,
+    window_reverse,
+    compute_sw_mask,
+    SpikingPatchEmbed,
+    SpikingMLP2d,
+    SpikingPatchMerging,
+)
 
 
 # ---------------------------------------------------------------------------
-# Sub-modules
+# Softmax Window Attention
 # ---------------------------------------------------------------------------
 
-class BNForTokens(nn.Module):
-    """BatchNorm1d for (B*nW, N, C) token sequences."""
+class SoftmaxWindowAttention(nn.Module):
+    """Standard scaled dot-product attention with softmax normalization.
 
-    def __init__(self, num_features: int):
-        super().__init__()
-        self.bn = nn.BatchNorm1d(num_features)
+    Stateless (NUM_STATES = 0) — no LIF membranes.
+    Drop-in replacement for SSAWindowAttention with identical forward signature.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bn(x.transpose(-1, -2)).transpose(-1, -2)
-
-
-class SSAWindowAttention(nn.Module):
-    """Spikformer-style Spiking Self-Attention with explicit state passing.
-
-    Uses spike coincidence (Q_spike @ K_spike^T) as continuous attention weights
-    applied directly to V — no gating LIF or cell state feedback.
-
-    Reference: Spikformer (Zhou et al., 2023) SSA module.
-
-    5 LIF neurons per module. All membranes are stored batch-first and reshaped
-    during forward for correct window-parallel computation.
-
-    State list (5 tensors):
-        [0] q_mem:    (B, nW*N, C)
-        [1] k_mem:    (B, nW*N, C)
-        [2] v_mem:    (B, nW*N, C)
-        [3] attn_mem: (B, nW*N, C)
-        [4] out_mem:  (B, nW*N, C)
+    State list: [] (empty)
     """
 
-    NUM_STATES = 5
+    NUM_STATES = 0
 
     def __init__(
         self,
         dim: int,
         window_size: Tuple[int, int],
         num_heads: int,
-        attn_scale: float = 0.125,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
         use_rel_pos_bias: bool = True,
-        snn_cfg: Optional[DictConfig] = None,
+        snn_cfg: Optional[DictConfig] = None,  # accepted but unused (interface compat)
     ):
         super().__init__()
         assert dim % num_heads == 0
         self.dim = dim
-        self.window_size = window_size   # (Wh, Ww)
+        self.window_size = window_size
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.attn_scale = attn_scale
+        self.scale = self.head_dim ** -0.5
+        self.N = window_size[0] * window_size[1]
         self.use_rel_pos_bias = use_rel_pos_bias
-        self.N = window_size[0] * window_size[1]  # tokens per window
 
-        beta_init = snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5
-        learn_beta = snn_cfg.get('learn_beta', True) if snn_cfg else True
-        threshold = snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0
-
-        # Q/K/V projections
-        self.proj_q = nn.Linear(dim, dim)
-        self.bn_q = BNForTokens(dim)
-        self.lif_q = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        self.proj_k = nn.Linear(dim, dim)
-        self.bn_k = BNForTokens(dim)
-        self.lif_k = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        self.proj_v = nn.Linear(dim, dim)
-        self.bn_v = BNForTokens(dim)
-        self.lif_v = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        # Attention output LIF (lower threshold, applied after attn @ V)
-        self.attn_lif = LIFNeuron(
-            beta_init=beta_init, learn_beta=learn_beta, threshold=0.5,
-        )
+        # Q/K/V: single fused linear projection
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.attn_drop = nn.Dropout(attn_drop)
 
         # Output projection
         self.proj_out = nn.Linear(dim, dim)
-        self.bn_out = BNForTokens(dim)
-        self.lif_out = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        # Relative position bias table (optional)
+        # Relative position bias (optional, same as SSA)
         if use_rel_pos_bias:
             self.relative_position_bias_table = nn.Parameter(
                 torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
@@ -181,195 +111,63 @@ class SSAWindowAttention(nn.Module):
         """
         Args:
             x: (B*nW, N, C) windowed tokens.
-            prev_mems: list of 5 batch-first membrane tensors, or None.
-            B: batch size (for reshape between storage and forward shapes).
+            prev_mems: ignored (stateless).
+            B: batch size.
             mask: (nW, N, N) shifted-window mask or None.
         Returns:
             output: (B*nW, N, C)
-            new_mems: list of 5 batch-first membrane tensors.
+            new_mems: [] (empty list)
         """
         BnW, N, C = x.shape
         H_heads, d = self.num_heads, self.head_dim
-        nW = BnW // B
 
-        # Unpack previous membranes (storage -> forward shape)
-        if prev_mems is None:
-            prev_mems = [None] * self.NUM_STATES
-        p_q, p_k, p_v, p_attn, p_out = prev_mems
+        # Q/K/V projection
+        qkv = self.qkv(x).reshape(BnW, N, 3, H_heads, d).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # each (BnW, H_heads, N, d)
 
-        # Reshape batch-first -> window-parallel
-        def to_fwd(mem: Optional[torch.Tensor], target_shape: Tuple[int, ...]) -> Optional[torch.Tensor]:
-            if mem is None:
-                return None
-            return mem.reshape(target_shape)
+        # Scaled dot-product
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (BnW, H, N, N)
 
-        p_q = to_fwd(p_q, (BnW, N, C))
-        p_k = to_fwd(p_k, (BnW, N, C))
-        p_v = to_fwd(p_v, (BnW, N, C))
-        p_attn = to_fwd(p_attn, (BnW, N, C))
-        p_out = to_fwd(p_out, (BnW, N, C))
-
-        # Q/K/V projections + LIF
-        q_spike, q_mem = self.lif_q(self.bn_q(self.proj_q(x)), p_q)
-        q = q_spike.reshape(BnW, N, H_heads, d).permute(0, 2, 1, 3).contiguous()
-
-        k_spike, k_mem = self.lif_k(self.bn_k(self.proj_k(x)), p_k)
-        k = k_spike.reshape(BnW, N, H_heads, d).permute(0, 2, 1, 3).contiguous()
-
-        v_spike, v_mem = self.lif_v(self.bn_v(self.proj_v(x)), p_v)
-        v = v_spike.reshape(BnW, N, H_heads, d).permute(0, 2, 1, 3).contiguous()
-
-        # Spike coincidence: Q @ K^T (always >= 0 since spikes are non-negative)
-        attn = (q @ k.transpose(-2, -1)) * self.attn_scale  # (BnW, H, N, N)
-
-        # Add relative position bias (optional)
+        # Relative position bias
         if self.use_rel_pos_bias:
             attn = attn + self._get_rel_pos_bias().unsqueeze(0)
 
-        # Apply shifted-window mask (zero invalid pairs)
+        # Shifted-window mask: additive (-100 for invalid) before softmax
         if mask is not None:
             nW_mask = mask.shape[0]
-            valid = (mask == 0).unsqueeze(1).unsqueeze(0)  # (1, nW, 1, N, N)
-            attn = (attn.view(-1, nW_mask, H_heads, N, N) * valid).reshape(-1, H_heads, N, N)
+            attn = attn.view(-1, nW_mask, H_heads, N, N)
+            attn = attn + mask.unsqueeze(0).unsqueeze(2)  # (1, nW, 1, N, N)
+            attn = attn.reshape(-1, H_heads, N, N)
 
-        # Store attention weights for visualization (detached, no grad impact)
+        # Softmax normalization
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # Store for visualization
         self._last_attn = attn.detach()
-        self._last_attn_meta = {'B': B, 'nW': nW, 'N': N, 'H_heads': H_heads}
+        self._last_attn_meta = {'B': B, 'nW': BnW // B, 'N': N, 'H_heads': H_heads}
 
-        # Continuous attention applied to V (no gating LIF)
-        out = attn @ v  # (BnW, H, N, d)
-        out = out.transpose(1, 2).reshape(BnW, N, C).contiguous()
+        # Weighted sum + output projection
+        out = (attn @ v).transpose(1, 2).reshape(BnW, N, C)
+        out = self.proj_drop(self.proj_out(out))
 
-        # Attention output LIF
-        out, attn_mem = self.attn_lif(out, p_attn)
-
-        # Output projection
-        out = self.bn_out(self.proj_out(out))
-        out, out_mem = self.lif_out(out, p_out)
-
-        # Reshape new membranes: forward -> batch-first storage
-        # Token-shaped mems (BnW, N, C) -> (B, nW*N, C)
-        new_mems = [
-            q_mem.reshape(B, nW * N, C),
-            k_mem.reshape(B, nW * N, C),
-            v_mem.reshape(B, nW * N, C),
-            attn_mem.reshape(B, nW * N, C),
-            out_mem.reshape(B, nW * N, C),
-        ]
-
-        return out, new_mems
+        return out, []
 
 
-class SpikingPatchEmbed(nn.Module):
-    """Spiking Patch Embedding: 4x spatial downsample via 2 strided convs + RPE.
+# ---------------------------------------------------------------------------
+# Block
+# ---------------------------------------------------------------------------
 
-    State list (3 tensors): [lif1_mem, lif2_mem, rpe_mem]
+class SoftmaxSwinBlock(nn.Module):
+    """Swin block with softmax attention + spiking MLP.
+
+    State list (2 or 4 tensors):
+        Without feedback: [mlp_mem0, mlp_mem1]
+        With feedback:    [mlp_mem0, mlp_mem1, fb_spike, fb_mem]
     """
 
-    NUM_STATES = 3
-
-    def __init__(self, in_channels: int, embed_dim: int, snn_cfg: Optional[DictConfig] = None):
-        super().__init__()
-        beta_init = snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5
-        learn_beta = snn_cfg.get('learn_beta', True) if snn_cfg else True
-        threshold = snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0
-        mid = embed_dim // 2
-
-        self.conv1 = nn.Conv2d(in_channels, mid, 3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(mid)
-        self.lif1 = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        self.conv2 = nn.Conv2d(mid, embed_dim, 3, stride=2, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(embed_dim)
-        self.lif2 = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        self.rpe_conv = nn.Conv2d(embed_dim, embed_dim, 3, padding=1, bias=False)
-        self.rpe_bn = nn.BatchNorm2d(embed_dim)
-        self.rpe_lif = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-    def forward(
-        self, x: torch.Tensor, prev_mems: Optional[List[Optional[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        if prev_mems is None:
-            prev_mems = [None] * self.NUM_STATES
-
-        s1, m1 = self.lif1(self.bn1(self.conv1(x)), prev_mems[0])
-        s2, m2 = self.lif2(self.bn2(self.conv2(s1)), prev_mems[1])
-        rpe_s, rpe_m = self.rpe_lif(self.rpe_bn(self.rpe_conv(s2)), prev_mems[2])
-        out = s2 + rpe_s
-
-        return out, [m1, m2, rpe_m]
-
-
-class SpikingMLP2d(nn.Module):
-    """Spiking MLP: Conv1x1 -> BN -> LIF -> Conv1x1 -> BN -> LIF.
-
-    State list (2 tensors): [lif1_mem, lif2_mem]
-    """
-
-    NUM_STATES = 2
-
-    def __init__(self, dim: int, mlp_ratio: float = 4.0, snn_cfg: Optional[DictConfig] = None):
-        super().__init__()
-        beta_init = snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5
-        learn_beta = snn_cfg.get('learn_beta', True) if snn_cfg else True
-        threshold = snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0
-        hidden = int(dim * mlp_ratio)
-
-        self.fc1 = nn.Conv2d(dim, hidden, 1)
-        self.bn1 = nn.BatchNorm2d(hidden)
-        self.lif1 = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-        self.fc2 = nn.Conv2d(hidden, dim, 1)
-        self.bn2 = nn.BatchNorm2d(dim)
-        self.lif2 = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-    def forward(
-        self, x: torch.Tensor, prev_mems: Optional[List[Optional[torch.Tensor]]],
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        if prev_mems is None:
-            prev_mems = [None] * self.NUM_STATES
-
-        s1, m1 = self.lif1(self.bn1(self.fc1(x)), prev_mems[0])
-        s2, m2 = self.lif2(self.bn2(self.fc2(s1)), prev_mems[1])
-        return s2, [m1, m2]
-
-
-class SpikingPatchMerging(nn.Module):
-    """2x spatial downsample: Conv3x3(C->2C, s=2) + BN + LIF.
-
-    State list (1 tensor): [lif_mem]
-    """
-
-    NUM_STATES = 1
-
-    def __init__(self, dim: int, snn_cfg: Optional[DictConfig] = None):
-        super().__init__()
-        beta_init = snn_cfg.get('beta_init', 0.5) if snn_cfg else 0.5
-        learn_beta = snn_cfg.get('learn_beta', True) if snn_cfg else True
-        threshold = snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0
-
-        self.conv = nn.Conv2d(dim, 2 * dim, 3, stride=2, padding=1, bias=False)
-        self.bn = nn.BatchNorm2d(2 * dim)
-        self.lif = LIFNeuron(beta_init=beta_init, learn_beta=learn_beta, threshold=threshold)
-
-    def forward(
-        self, x: torch.Tensor, prev_mem: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        spike, mem = self.lif(self.bn(self.conv(x)), prev_mem)
-        return spike, mem
-
-
-class SpikingSwinBlock(nn.Module):
-    """Spiking Swin Transformer Block: SSA Attention + MLP with residuals.
-
-    State list (7 or 9 tensors):
-        Without feedback: [attn_mem0..4, mlp_mem0..1]
-        With feedback:    [attn_mem0..4, mlp_mem0..1, fb_spike, fb_mem]
-    """
-
-    ATTN_STATES = SSAWindowAttention.NUM_STATES   # 5
-    MLP_STATES = SpikingMLP2d.NUM_STATES          # 2
+    ATTN_STATES = SoftmaxWindowAttention.NUM_STATES   # 0
+    MLP_STATES = SpikingMLP2d.NUM_STATES              # 2
 
     def __init__(
         self,
@@ -379,7 +177,8 @@ class SpikingSwinBlock(nn.Module):
         window_size: Optional[int] = 8,
         shift_size: int = 0,
         mlp_ratio: float = 4.0,
-        attn_scale: float = 0.125,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
         use_rel_pos_bias: bool = True,
         snn_cfg: Optional[DictConfig] = None,
         use_feedback: bool = False,
@@ -393,16 +192,16 @@ class SpikingSwinBlock(nn.Module):
             self.shift_size = 0
             self.global_attn = True
             attn_window = (H, W)
-            self.window_size = min(H, W)  # not used for partitioning
+            self.window_size = min(H, W)
         else:
             self.window_size = window_size
             self.shift_size = shift_size
             self.global_attn = False
             attn_window = (window_size, window_size)
 
-        self.attn = SSAWindowAttention(
+        self.attn = SoftmaxWindowAttention(
             dim=dim, window_size=attn_window, num_heads=num_heads,
-            attn_scale=attn_scale,
+            attn_drop=attn_drop, proj_drop=proj_drop,
             use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
         )
         self.mlp = SpikingMLP2d(dim=dim, mlp_ratio=mlp_ratio, snn_cfg=snn_cfg)
@@ -443,11 +242,9 @@ class SpikingSwinBlock(nn.Module):
             new_mems: list of NUM_STATES batch-first membrane tensors.
         """
         if prev_mems is None:
-            attn_mems = None
             mlp_mems = None
             fb_prev_spike, fb_prev_mem = None, None
         else:
-            attn_mems = prev_mems[:self.ATTN_STATES]
             mlp_mems = prev_mems[self.ATTN_STATES:self.ATTN_STATES + self.MLP_STATES]
             if self.use_feedback:
                 fb_prev_spike = prev_mems[self.ATTN_STATES + self.MLP_STATES]
@@ -466,7 +263,7 @@ class SpikingSwinBlock(nn.Module):
         if self.global_attn:
             N = H * W
             x_tokens = x.reshape(B, C, N).permute(0, 2, 1).contiguous()  # (B, N, C)
-            attn_out, attn_new = self.attn(x_tokens, attn_mems, B, mask=None)
+            attn_out, attn_new = self.attn(x_tokens, None, B, mask=None)
             x = attn_out.permute(0, 2, 1).contiguous().reshape(B, C, H, W)
         else:
             ws = self.window_size
@@ -478,7 +275,7 @@ class SpikingSwinBlock(nn.Module):
             windows = window_partition(x, ws)             # (B*nW, ws, ws, C)
             windows = windows.view(-1, ws * ws, C)        # (B*nW, N, C)
 
-            attn_out, attn_new = self.attn(windows, attn_mems, B, mask=self.attn_mask)
+            attn_out, attn_new = self.attn(windows, None, B, mask=self.attn_mask)
 
             x = attn_out.view(-1, ws, ws, C)
             x = window_reverse(x, ws, H, W)              # (B, H, W, C)
@@ -488,7 +285,7 @@ class SpikingSwinBlock(nn.Module):
 
             x = x.permute(0, 3, 1, 2).contiguous()       # (B, C, H, W)
 
-        # Capture attention output spike for feedback BEFORE residual
+        # Capture attention output for feedback BEFORE residual
         if self.use_feedback:
             fb_spike, fb_mem = self.fb_lif(x, fb_prev_mem)
 
@@ -505,8 +302,12 @@ class SpikingSwinBlock(nn.Module):
         return x, new_mems
 
 
-class SpikingSwinStage(nn.Module):
-    """One stage: N blocks + optional patch merging + optional readout LIF.
+# ---------------------------------------------------------------------------
+# Stage
+# ---------------------------------------------------------------------------
+
+class SoftmaxSwinStage(nn.Module):
+    """One stage: N softmax-attn blocks + optional patch merging + optional readout LIF.
 
     State: flat list of all membrane tensors in the stage.
     """
@@ -519,7 +320,8 @@ class SpikingSwinStage(nn.Module):
         num_heads: int,
         window_size: Optional[int] = 8,
         mlp_ratio: float = 4.0,
-        attn_scale: float = 0.125,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
         downsample: bool = True,
         has_readout: bool = True,
         use_rel_pos_bias: bool = True,
@@ -534,18 +336,16 @@ class SpikingSwinStage(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(depth):
             shift = 0 if (i % 2 == 0) else (window_size // 2 if window_size else 0)
-            self.blocks.append(SpikingSwinBlock(
+            self.blocks.append(SoftmaxSwinBlock(
                 dim=dim, input_resolution=input_resolution, num_heads=num_heads,
                 window_size=window_size, shift_size=shift, mlp_ratio=mlp_ratio,
-                attn_scale=attn_scale,
+                attn_drop=attn_drop, proj_drop=proj_drop,
                 use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
                 use_feedback=use_feedback,
             ))
 
         self.downsample = SpikingPatchMerging(dim, snn_cfg=snn_cfg) if downsample else None
 
-        # Readout path: Conv1x1 + BN + LIF -> membrane for FPN
-        # Only created for stages whose output is consumed (e.g. by FPN).
         if has_readout:
             self.readout_conv = nn.Conv2d(dim, dim, 1, bias=False)
             self.readout_bn = nn.BatchNorm2d(dim)
@@ -555,9 +355,9 @@ class SpikingSwinStage(nn.Module):
                 threshold=snn_cfg.get('threshold', 1.0) if snn_cfg else 1.0,
             )
 
-        # Compute state sizes (use instance NUM_STATES from block, not class constant)
+        # Use instance NUM_STATES from block (varies with use_feedback)
         self._block_states = self.blocks[0].NUM_STATES
-        self._merge_states = SpikingPatchMerging.NUM_STATES if downsample else 0  # 0 or 1
+        self._merge_states = SpikingPatchMerging.NUM_STATES if downsample else 0
         self._readout_states = 1 if has_readout else 0
         self.num_states = depth * self._block_states + self._merge_states + self._readout_states
 
@@ -574,7 +374,7 @@ class SpikingSwinStage(nn.Module):
             B: batch size.
         Returns:
             readout_mem: (B, C, H, W) continuous membrane for FPN, or None.
-            x_out: (B, C', H', W') output for next stage (spike after merge, or spike).
+            x_out: (B, C', H', W') output for next stage.
             new_state: flat list of membrane tensors.
         """
         new_state: List[torch.Tensor] = []
@@ -611,21 +411,24 @@ class SpikingSwinStage(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Top-level backbone
+# Backbone
 # ---------------------------------------------------------------------------
 
-class SNNSwinBackbone(BaseDetector):
-    """SNN Swin Transformer backbone with SSA attention.
+class SoftmaxSwinBackbone(BaseDetector):
+    """SoftmaxSwin backbone: softmax attention + spiking everything else.
 
     Config keys (under model.backbone):
-        name: "SNNSwin"
+        name: "SoftmaxSwin"
         input_channels: 20
         embed_dim: 64
         depths: [2, 2, 2, 2]
         num_heads: [2, 4, 8, 16]
         window_sizes: [8, 8, 4, null]
         mlp_ratio: 4.0
-        attn_scale: 0.125
+        attn_drop: 0.0
+        proj_drop: 0.0
+        use_rel_pos_bias: true
+        output_stages: [2, 3, 4]
         snn:
             beta_init: 0.5
             learn_beta: true
@@ -642,7 +445,8 @@ class SNNSwinBackbone(BaseDetector):
         num_heads = list(mdl_config.num_heads)
         window_sizes = [None if ws is None else int(ws) for ws in mdl_config.window_sizes]
         mlp_ratio = mdl_config.get('mlp_ratio', 4.0)
-        attn_scale = mdl_config.get('attn_scale', 0.125)
+        attn_drop = mdl_config.get('attn_drop', 0.0)
+        proj_drop = mdl_config.get('proj_drop', 0.0)
         use_rel_pos_bias = mdl_config.get('use_rel_pos_bias', True)
         output_stages = set(mdl_config.get('output_stages', [1, 2, 3, 4]))
         snn_cfg = mdl_config.snn
@@ -654,7 +458,7 @@ class SNNSwinBackbone(BaseDetector):
         assert len(num_heads) == num_stages
         assert len(window_sizes) == num_stages
 
-        # Patch embedding
+        # Patch embedding (spiking)
         self.patch_embed = SpikingPatchEmbed(
             in_channels=in_channels, embed_dim=embed_dim, snn_cfg=snn_cfg,
         )
@@ -667,13 +471,13 @@ class SNNSwinBackbone(BaseDetector):
         self.stage_dims: List[int] = []
         self._strides: List[int] = []
         dim = embed_dim
-        stride = 4  # patch embed stride
+        stride = 4
 
         for i in range(num_stages):
-            self.stages.append(SpikingSwinStage(
+            self.stages.append(SoftmaxSwinStage(
                 dim=dim, input_resolution=(H, W), depth=depths[i],
                 num_heads=num_heads[i], window_size=window_sizes[i],
-                mlp_ratio=mlp_ratio, attn_scale=attn_scale,
+                mlp_ratio=mlp_ratio, attn_drop=attn_drop, proj_drop=proj_drop,
                 downsample=(i < num_stages - 1),
                 has_readout=((i + 1) in output_stages),
                 use_rel_pos_bias=use_rel_pos_bias, snn_cfg=snn_cfg,
@@ -713,8 +517,8 @@ class SNNSwinBackbone(BaseDetector):
             prev_states: [embed_state, stage0_state, ...] or None.
             token_mask: ignored (interface compatibility).
         Returns:
-            features: {1: readout1, 2: readout2, 3: readout3, 4: readout4}
-            states: [embed_state, stage0_state, stage1_state, stage2_state, stage3_state]
+            features: {1: readout1, 2: readout2, ...}
+            states: [embed_state, stage0_state, ...]
         """
         B = x.shape[0]
 

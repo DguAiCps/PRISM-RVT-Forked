@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /model/snn_yolox: default
+  - /model/plateau_snn_yolox: default
 
 training:
   precision: 16
@@ -19,8 +19,8 @@ validation:
   val_check_interval: null
   check_val_every_n_epoch: 1
 batch_size:
-  train: 8
-  eval: 8
+  train: 4
+  eval: 4
 hardware:
   num_workers:
     train: 6

@@ -50,6 +50,7 @@ class VizCallbackBase(Callback):
 
     def on_train_batch_end_custom(self,
                                   logger: WandbLogger,
+                                  pl_module: pl.LightningModule,
                                   outputs: Any,
                                   batch: Any,
                                   log_n_samples: int,
@@ -94,6 +95,7 @@ class VizCallbackBase(Callback):
 
         self.on_train_batch_end_custom(
             logger=logger,
+            pl_module=pl_module,
             outputs=outputs,
             batch=batch,
             log_n_samples=n_samples,

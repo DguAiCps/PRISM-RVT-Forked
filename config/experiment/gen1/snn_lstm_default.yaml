@@ -1,6 +1,6 @@
 # @package _global_
 defaults:
-  - /model/snn_yolox: default
+  - /model/snn_lstm_yolox: default
 
 training:
   precision: 16

@@ -4,12 +4,12 @@ defaults:
 
 model:
   backbone:
-    name: SNNCNN
+    name: SNNCNNLSTM
     input_channels: 20
     enable_masking: false
     embed_dim: 64
     dim_multiplier: [1, 2, 4, 8]
-    num_conv_layers: [3, 3, 3, 3]
+    num_conv_layers: [2, 2, 2, 2]
     stem:
       patch_size: 4
     snn:

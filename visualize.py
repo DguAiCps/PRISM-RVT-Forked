@@ -67,35 +67,26 @@ from utils.evaluation.prophesee.visualize.vis_utils import (
 from utils.padding import InputPadderFromShape
 from modules.utils.detection import RNNStates
 from models.detection.recurrent_backbone.snn_swin import (
-    CGRAWindowAttention, window_reverse,
+    SSAWindowAttention, window_reverse,
 )
 
 
 class AttentionCaptureHook:
-    """Forward hook that captures attention maps from CGRAWindowAttention."""
+    """Captures attention weight maps from SSAWindowAttention."""
 
     def __init__(self):
-        self.attn_spikes = []   # binary attention: list of (BnW, H_heads, N, N)
-        self.cell_mems = []     # cell membrane: list of (BnW, H_heads, N, N)
-        self.metadata = []      # (B, nW, N, H_heads, window_size, H, W, shift_size)
+        self.attn_weights = []  # continuous attention: list of (BnW, H_heads, N, N)
+        self.metadata = []
 
     def clear(self):
-        self.attn_spikes.clear()
-        self.cell_mems.clear()
+        self.attn_weights.clear()
         self.metadata.clear()
-
-    def hook_fn(self, module, args, output):
-        """Capture intermediate attention data via a wrapper around forward."""
-        # output is (out, new_mems) from CGRAWindowAttention.forward
-        # We can't directly access intermediates from hook, so we use a modified approach
-        pass
 
 
 def register_attn_hooks(backbone, target_stage: int):
-    """Register hooks on CGRAWindowAttention modules in the target stage.
+    """Register hooks on SSAWindowAttention modules in the target stage.
 
-    Instead of standard hooks (which can't access intermediates), we
-    monkey-patch the forward method to store attention maps.
+    Monkey-patches the forward method to capture the Q@K^T attention weights.
     """
     capture = AttentionCaptureHook()
     stage = backbone.stages[target_stage - 1]  # 1-indexed
@@ -104,25 +95,38 @@ def register_attn_hooks(backbone, target_stage: int):
         attn_module = blk.attn
         original_forward = attn_module.forward
 
-        def make_wrapper(orig_fwd, blk_ref):
+        def make_wrapper(orig_fwd, mod, blk_ref):
             def wrapped_forward(x, prev_mems, B, mask=None):
-                out, new_mems = orig_fwd(x, prev_mems, B, mask)
-
-                # Recompute attention spike for capture (cheap since spikes are in new_mems)
-                # cell_mem is new_mems[3]: (B, nW*H_heads, N, N)
-                BnW = x.shape[0]
-                N = attn_module.N
-                H_heads = attn_module.num_heads
+                # Recompute Q@K^T to capture attention weights
+                BnW, N, C = x.shape
+                H_heads = mod.num_heads
+                d = mod.head_dim
                 nW = BnW // B
 
-                cell_mem = new_mems[3]  # (B, nW*H_heads, N, N)
-                cell_mem_reshaped = cell_mem.reshape(BnW, H_heads, N, N)
+                # Unpack previous membranes
+                if prev_mems is None:
+                    prev_mems_list = [None] * mod.NUM_STATES
+                else:
+                    prev_mems_list = prev_mems
 
-                # cell_spike: threshold at 1.0 (same as attn_cell_lif threshold)
-                cell_spike = (cell_mem_reshaped > 0).float()
+                p_q = prev_mems_list[0]
+                p_k = prev_mems_list[1]
+                if p_q is not None:
+                    p_q = p_q.reshape(BnW, N, C)
+                if p_k is not None:
+                    p_k = p_k.reshape(BnW, N, C)
 
-                capture.attn_spikes.append(cell_spike.detach().cpu())
-                capture.cell_mems.append(cell_mem_reshaped.detach().cpu())
+                # Compute Q and K spikes (same as forward)
+                q_spike, _ = mod.lif_q(mod.bn_q(mod.proj_q(x)), p_q)
+                q = q_spike.reshape(BnW, N, H_heads, d).permute(0, 2, 1, 3).contiguous()
+                k_spike, _ = mod.lif_k(mod.bn_k(mod.proj_k(x)), p_k)
+                k = k_spike.reshape(BnW, N, H_heads, d).permute(0, 2, 1, 3).contiguous()
+
+                attn = (q @ k.transpose(-2, -1)) * mod.attn_scale
+                if mod.use_rel_pos_bias:
+                    attn = attn + mod._get_rel_pos_bias().unsqueeze(0)
+
+                capture.attn_weights.append(attn.detach().cpu())
                 capture.metadata.append({
                     'B': B, 'nW': nW, 'N': N, 'H_heads': H_heads,
                     'window_size': blk_ref.window_size,
@@ -130,26 +134,27 @@ def register_attn_hooks(backbone, target_stage: int):
                     'shift_size': blk_ref.shift_size,
                     'global_attn': blk_ref.global_attn,
                 })
-                return out, new_mems
+
+                # Run the actual forward
+                return orig_fwd(x, prev_mems, B, mask)
             return wrapped_forward
 
-        attn_module.forward = make_wrapper(original_forward, blk)
+        attn_module.forward = make_wrapper(original_forward, attn_module, blk)
 
     return capture
 
 
 def attn_to_spatial_map(capture: AttentionCaptureHook, batch_idx: int = 0) -> np.ndarray:
-    """Convert captured attention data to a spatial heatmap.
+    """Convert captured attention weights to a spatial heatmap.
 
-    For each block, we compute the average attention each spatial position
-    receives (mean over heads, mean over query tokens of how much each
-    key token is attended to). Then average across blocks.
+    For each block, compute average attention each spatial position receives
+    (mean over heads, mean over query dimension). Then average across blocks.
 
     Returns: (H, W) float32 heatmap normalized to [0, 1].
     """
     spatial_maps = []
 
-    for blk_i in range(len(capture.cell_mems)):
+    for blk_i in range(len(capture.attn_weights)):
         meta = capture.metadata[blk_i]
         B = meta['B']
         nW = meta['nW']
@@ -160,44 +165,34 @@ def attn_to_spatial_map(capture: AttentionCaptureHook, batch_idx: int = 0) -> np
         shift = meta['shift_size']
         global_attn = meta['global_attn']
 
-        # cell_mem: (BnW, H_heads, N, N) — use membrane potential as attention intensity
-        cell_mem = capture.cell_mems[blk_i]
-
-        # Select batch item
+        # attn_weights: (BnW, H_heads, N, N)
+        attn = capture.attn_weights[blk_i]
         BnW = B * nW
         # Reshape to (B, nW, H_heads, N, N)
-        mem = cell_mem.reshape(B, nW, H_heads, N, N)
-        mem = mem[batch_idx]  # (nW, H_heads, N, N)
+        attn = attn.reshape(B, nW, H_heads, N, N)
+        attn = attn[batch_idx]  # (nW, H_heads, N, N)
 
         # Average over heads: (nW, N, N)
-        mem_avg = mem.mean(dim=1)
+        attn_avg = attn.mean(dim=1)
 
-        # For each key token, sum attention it receives from all queries: (nW, N)
-        key_importance = mem_avg.mean(dim=1)  # mean over query dim -> (nW, N)
+        # For each key token, mean attention it receives from all queries: (nW, N)
+        key_importance = attn_avg.mean(dim=1)
 
         if global_attn:
-            # N = H*W, single window covering the whole feature map
             spatial = key_importance[0].reshape(H, W)
         else:
-            # Reconstruct spatial map from windows
-            # key_importance: (nW, N) -> (nW, ws, ws)
             key_2d = key_importance.reshape(nW, ws, ws)
-            # Add channel dim for window_reverse: (nW, ws, ws, 1)
             key_4d = key_2d.unsqueeze(-1)
-            # (B=1)*nW windows -> (1, H, W, 1)
             spatial_4d = window_reverse(key_4d, ws, H, W)
-            spatial = spatial_4d[0, :, :, 0]  # (H, W)
+            spatial = spatial_4d[0, :, :, 0]
 
-            # Undo shift
             if shift > 0:
                 spatial = torch.roll(spatial, shifts=(shift, shift), dims=(0, 1))
 
         spatial_maps.append(spatial.numpy())
 
-    # Average across blocks
     combined = np.mean(spatial_maps, axis=0)
 
-    # Normalize to [0, 1]
     vmin, vmax = combined.min(), combined.max()
     if vmax - vmin > 1e-8:
         combined = (combined - vmin) / (vmax - vmin)
@@ -271,6 +266,9 @@ def main(config: DictConfig):
     fps = int(config.get('fps', 20))
     attn_vis = bool(config.get('attn_vis', False))
     attn_stage = int(config.get('attn_stage', 2))  # 1-indexed
+    conf_thre = float(config.get('conf_thre', 0.0))  # 0 = use model default
+    skip_batches = int(config.get('skip_batches', 0))  # skip N batches before recording
+    stateless = bool(config.get('stateless', False))  # reset states every timestep (ablation: no temporal memory)
 
     # In data_only mode, fill in mandatory model config placeholders
     if data_only:
@@ -283,7 +281,6 @@ def main(config: DictConfig):
             config.model.backbone.window_sizes = [8, 8, 4, None]
             config.model.backbone.mlp_ratio = 4.0
             config.model.backbone.attn_scale = 0.125
-            config.model.backbone.output_scale = 0.25
             config.model.backbone.use_rel_pos_bias = False
             config.model.backbone.output_stages = [2, 3, 4]
             config.model.backbone.snn = {
@@ -387,6 +384,7 @@ def main(config: DictConfig):
 
             sequence_len = len(ev_tensor_sequence)
             batch_size = ev_tensor_sequence[0].shape[0]
+            recording = batch_idx >= skip_batches
 
             for tidx in range(sequence_len):
                 if done:
@@ -401,18 +399,19 @@ def main(config: DictConfig):
                     ev_tensor = input_padder.pad_tensor_ev_repr(ev_tensor)
 
                     backbone_features, states = mdl.forward_backbone(
-                        x=ev_tensor, previous_states=prev_states)
+                        x=ev_tensor, previous_states=None if stateless else prev_states)
                     prev_states = states
 
-                    if not collect:
+                    if not collect or not recording:
                         continue
 
                     # Run detection at every collected timestep
                     predictions, _ = mdl.forward_detect(backbone_features=backbone_features)
+                    effective_conf = conf_thre if conf_thre > 0 else mdl_config.postprocess.confidence_threshold
                     pred_processed = postprocess(
                         prediction=predictions,
                         num_classes=mdl_config.head.num_classes,
-                        conf_thre=mdl_config.postprocess.confidence_threshold,
+                        conf_thre=effective_conf,
                         nms_thre=mdl_config.postprocess.nms_threshold)
 
                     # Check if GT labels exist at this timestep
@@ -425,7 +424,7 @@ def main(config: DictConfig):
 
                     # Compute attention heatmap if enabled
                     attn_heatmaps = {}
-                    if attn_capture is not None and len(attn_capture.cell_mems) > 0:
+                    if attn_capture is not None and len(attn_capture.attn_weights) > 0:
                         for bi in range(batch_size):
                             attn_heatmaps[bi] = attn_to_spatial_map(attn_capture, batch_idx=bi)
                         attn_capture.clear()
@@ -498,6 +497,8 @@ def main(config: DictConfig):
 
                 # ===== Data-only path =====
                 else:
+                    if not recording:
+                        continue
                     for bi in range(batch_size):
                         ev_np = ev_tensor_sequence[tidx][bi].cpu().numpy()
                         ev_img = ev_repr_to_img(ev_np)

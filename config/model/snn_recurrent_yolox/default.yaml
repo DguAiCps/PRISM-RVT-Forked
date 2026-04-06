@@ -4,24 +4,19 @@ defaults:
 
 model:
   backbone:
-    name: SNNCNN
+    name: SNNCNNRecurrent
     input_channels: 20
     enable_masking: false
     embed_dim: 64
     dim_multiplier: [1, 2, 4, 8]
-    num_conv_layers: [3, 3, 3, 3]
+    num_conv_layers: [2, 2, 2, 2]
     stem:
       patch_size: 4
     snn:
-      beta_init: 0.5
+      beta_init: 0.9
       learn_beta: true
       threshold: 1.0
       reset_mechanism: subtract
-      channelwise_beta: true
-      beta_spread: 0.3
-      learn_reset: true
-      reset_ratio_init: 0.7
-      reset_spread: 0.3
   fpn:
     name: PAFPN
     compile:

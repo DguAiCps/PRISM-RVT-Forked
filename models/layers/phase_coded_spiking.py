@@ -54,13 +54,15 @@ fs_stream_fn = FSStreamSurrogate.apply
 
 
 def make_thresholds(n_bits: int, v_th: float, mode: str) -> torch.Tensor:
-    """Build descending threshold vector of length n_bits.
+    """Build threshold vector of length n_bits.
 
-    mode == 'uniform': theta_k = v_th / N for all k (thermometer encoding)
-    mode == 'fs':      theta_k = v_th / 2^{k+1}   (binary encoding)
+    mode == 'uniform': theta_k = v_th for all k (thermometer encoding,
+        encoding range [0, N*v_th] with N+1 levels spaced by v_th).
+    mode == 'fs':      theta_k = v_th / 2^{k+1}, descending
+        (binary encoding, range [0, v_th) with 2^N levels).
     """
     if mode == 'uniform':
-        return torch.full((n_bits,), v_th / n_bits, dtype=torch.float32)
+        return torch.full((n_bits,), v_th, dtype=torch.float32)
     if mode == 'fs':
         return torch.tensor(
             [v_th / (2.0 ** (k + 1)) for k in range(n_bits)],

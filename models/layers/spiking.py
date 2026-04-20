@@ -77,7 +77,7 @@ class LIFNeuron(nn.Module):
 
 
 class SpikingConvBlock(nn.Module):
-    """Conv2d + BatchNorm2d + LIF neuron.
+    """Conv2d + (optional Norm) + LIF neuron.
 
     Input:  (N, C_in, H, W) float tensor
     Output: spike (N, C_out, H', W') binary, membrane (N, C_out, H', W') float
@@ -96,14 +96,18 @@ class SpikingConvBlock(nn.Module):
                  reset_mechanism: str = 'subtract',
                  channelwise_beta: bool = False,
                  beta_spread: float = 0.0,
-                 surrogate: str = 'triangle'):
+                 surrogate: str = 'triangle',
+                 norm: str = 'bn'):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels,
                               kernel_size=kernel_size,
                               stride=stride,
                               padding=padding,
-                              bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
+                              bias=(norm == 'none'))
+        if norm == 'none':
+            self.bn = nn.Identity()
+        else:
+            self.bn = nn.BatchNorm2d(out_channels)
         self.lif = LIFNeuron(
             beta_init=beta_init,
             learn_beta=learn_beta,

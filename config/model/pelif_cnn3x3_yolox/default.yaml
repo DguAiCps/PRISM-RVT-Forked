@@ -1,6 +1,7 @@
 # @package _global_
-# PeLIF-CNN with stacked PeLIFConvBlocks (1x1 recurrence, temporal only).
+# PeLIF-CNN with 3x3 recurrent kernel and stacked PeLIFConvBlocks.
 # Every layer is recurrent (matching sMNIST PeLIFRecurrentLayer design).
+# With rec_kernel_size=3, signals propagate spatially through recurrence.
 defaults:
   - override /model: rnndet
 
@@ -12,7 +13,7 @@ model:
     dim_multiplier: [1, 2, 4, 8]
     num_conv_layers: [2, 2, 2, 2]
     periods: [1, 2, 4, 8]
-    rec_kernel_size: 1
+    rec_kernel_size: 3
     norm: none
     enable_masking: false
     stem:

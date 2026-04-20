@@ -1,19 +1,20 @@
 # @package _global_
-# PeLIF-CNN with stacked PeLIFConvBlocks (1x1 recurrence, temporal only).
-# Every layer is recurrent (matching sMNIST PeLIFRecurrentLayer design).
+# PeLIF-CNN + spike-driven attention (Spikformer-style window + grid).
+# Every stage: PeLIFConvBlock × N → SpikePartitionAttention (window+grid) → PeLIFNeuron readout
 defaults:
   - override /model: rnndet
 
 model:
   backbone:
-    name: PeLIFCNN
+    name: PeLIFCNNAttn
     input_channels: 20
     embed_dim: 64
     dim_multiplier: [1, 2, 4, 8]
-    num_conv_layers: [2, 2, 2, 2]
+    num_conv_layers: [1, 1, 1, 1]
     periods: [1, 2, 4, 8]
-    rec_kernel_size: 1
+    rec_kernel_size: 3
     norm: none
+    partition_split_32: 1       # partition_size = (H/32, W/32) = (8, 10) for 256x320
     enable_masking: false
     stem:
       patch_size: 4
@@ -22,6 +23,13 @@ model:
       learn_beta: true
       threshold: 0.5
       surrogate: triangle
+    attention:
+      partition_size: ???       # filled by config/modifier.py
+      dim_head: 32
+      threshold: 1.0
+      beta_init: 0.9
+      learn_beta: true
+      qkv_bias: false
   fpn:
     name: PAFPN
     compile: { enable: false, args: { mode: reduce-overhead } }

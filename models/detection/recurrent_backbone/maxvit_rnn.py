@@ -11,8 +11,10 @@ except ImportError:
 
 from data.utils.types import FeatureMap, BackboneFeatures, LstmState, LstmStates
 from models.layers.rnn import DWSConvLSTM2d
+from models.layers.pelif_rnn import PeLIFConv2d
 from models.layers.maxvit.maxvit import (
     PartitionAttentionCl,
+    nChw_2_nhwC,
     nhwC_2_nChw,
     get_downsample_layer_Cf2Cl,
     PartitionType)
@@ -145,19 +147,46 @@ class RNNDetectorStage(nn.Module):
         lstm_cfg = stage_cfg.lstm
         attention_cfg = stage_cfg.attention
 
+        # Recurrent module: select between DWSConvLSTM2d (default) and PeLIFConv2d.
+        # Config keys:
+        #   stage.lstm.type  — 'lstm' (default) or 'pelif'
+        #   stage.lstm.order — 'post' (default, RNN after attention) or 'pre' (RNN before attention)
+        rnn_type = lstm_cfg.get('type', 'lstm')
+        rnn_order = lstm_cfg.get('order', 'post')
+        self.rnn_before_attn = (rnn_type == 'pelif' and rnn_order == 'pre')
+
         self.downsample_cf2cl = get_downsample_layer_Cf2Cl(dim_in=dim_in,
                                                            dim_out=stage_dim,
                                                            downsample_factor=spatial_downsample_factor,
                                                            downsample_cfg=downsample_cfg)
+
+        # When PeLIF is before attention, its membrane output is not normed by
+        # downsample, so the first attention block must NOT skip its norm1.
+        first_skip_norm = (not self.rnn_before_attn) and self.downsample_cf2cl.output_is_normed()
         blocks = [MaxVitAttentionPairCl(dim=stage_dim,
-                                        skip_first_norm=i == 0 and self.downsample_cf2cl.output_is_normed(),
+                                        skip_first_norm=i == 0 and first_skip_norm,
                                         attention_cfg=attention_cfg) for i in range(num_blocks)]
         self.att_blocks = nn.ModuleList(blocks)
-        self.lstm = DWSConvLSTM2d(dim=stage_dim,
-                                  dws_conv=lstm_cfg.dws_conv,
-                                  dws_conv_only_hidden=lstm_cfg.dws_conv_only_hidden,
-                                  dws_conv_kernel_size=lstm_cfg.dws_conv_kernel_size,
-                                  cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
+
+        if rnn_type == 'lstm':
+            self.lstm = DWSConvLSTM2d(dim=stage_dim,
+                                      dws_conv=lstm_cfg.dws_conv,
+                                      dws_conv_only_hidden=lstm_cfg.dws_conv_only_hidden,
+                                      dws_conv_kernel_size=lstm_cfg.dws_conv_kernel_size,
+                                      cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
+        elif rnn_type == 'pelif':
+            self.lstm = PeLIFConv2d(
+                dim=stage_dim,
+                periods=tuple(lstm_cfg.get('periods', (1, 2, 4, 8))),
+                v_th=lstm_cfg.get('v_th', 1.0),
+                beta_init=lstm_cfg.get('beta_init', 0.9),
+                learn_beta=lstm_cfg.get('learn_beta', True),
+                dws_conv_x=lstm_cfg.get('dws_conv_x', True),
+                dws_conv_kernel_size=lstm_cfg.get('dws_conv_kernel_size', 3),
+                surrogate=lstm_cfg.get('surrogate', 'triangle'),
+                cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
+        else:
+            raise ValueError(f"Unknown rnn type '{rnn_type}'. Expected 'lstm' or 'pelif'.")
 
         ###### Mask Token ################
         self.mask_token = nn.Parameter(th.zeros(1, 1, 1, stage_dim),
@@ -174,9 +203,21 @@ class RNNDetectorStage(nn.Module):
         if token_mask is not None:
             assert self.mask_token is not None, 'No mask token present in this stage'
             x[token_mask] = self.mask_token
-        for blk in self.att_blocks:
-            x = blk(x)
-        x = nhwC_2_nChw(x)  # N H W C -> N C H W
-        h_c_tuple = self.lstm(x, h_and_c_previous)
-        x = h_c_tuple[0]
+
+        if self.rnn_before_attn:
+            # PeLIF-before-attention: temporal recurrence → spatial attention
+            x_cf = nhwC_2_nChw(x)                # N H W C -> N C H W (for PeLIF)
+            h_c_tuple = self.lstm(x_cf, h_and_c_previous)
+            x = nChw_2_nhwC(h_c_tuple[0])        # membrane N C H W -> N H W C
+            for blk in self.att_blocks:
+                x = blk(x)                        # attention on membrane
+            x = nhwC_2_nChw(x)                    # N H W C -> N C H W (output)
+        else:
+            # Original order: spatial attention → temporal recurrence
+            for blk in self.att_blocks:
+                x = blk(x)
+            x = nhwC_2_nChw(x)                    # N H W C -> N C H W
+            h_c_tuple = self.lstm(x, h_and_c_previous)
+            x = h_c_tuple[0]
+
         return x, h_c_tuple

@@ -53,6 +53,21 @@ def dynamically_modify_train_config(config: DictConfig):
                 mdl_hw = _get_modified_hw_multiple_of(hw=dataset_hw, multiple_of=32)
                 print(f'Set {backbone_name} backbone (height, width) to {mdl_hw}')
                 backbone_cfg.in_res_hw = mdl_hw
+            elif backbone_name == 'PeLIFCNNAttn':
+                # Spike attention at every stage; require resolution aligned to 32.
+                # partition_size is used at all stages (stage 0 has H/4 × W/4 map).
+                partition_split_32 = backbone_cfg.get('partition_split_32', 1)
+                assert partition_split_32 in (1, 2, 4)
+                multiple_of = 32 * partition_split_32
+                mdl_hw = _get_modified_hw_multiple_of(hw=dataset_hw, multiple_of=multiple_of)
+                print(f'Set {backbone_name} backbone (height, width) to {mdl_hw}')
+                backbone_cfg.in_res_hw = mdl_hw
+                attn_cfg = backbone_cfg.attention
+                partition_size = tuple(x // (32 * partition_split_32) for x in mdl_hw)
+                assert (mdl_hw[0] // 32) % partition_size[0] == 0
+                assert (mdl_hw[1] // 32) % partition_size[1] == 0
+                print(f'Set partition sizes: {partition_size}')
+                attn_cfg.partition_size = partition_size
             else:
                 print(f'{backbone_name=} not available')
                 raise NotImplementedError

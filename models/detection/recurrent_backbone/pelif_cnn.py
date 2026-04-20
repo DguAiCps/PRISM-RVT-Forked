@@ -1,149 +1,197 @@
-"""PeLIF-CNN backbone: LIF for spatial extraction + PeLIF for temporal memory.
+"""PeLIF-CNN backbone: stacked PeLIF recurrent conv layers.
 
 Architecture per stage:
-    [LIF Conv layers] → spatial feature extraction (responds to every input)
-    [PeLIF block]     → temporal memory with multi-period recurrence
+    PeLIFConvBlock (downsample) → PeLIFConvBlock (refine) × (N-1)
 
-This separation ensures:
-    - Events are processed immediately by LIF (no period gating on features)
-    - Temporal memory is maintained by PeLIF even when events are absent
+Every layer has the same structure as sMNIST's PeLIFRecurrentLayer:
+    u[t] = beta * u[t-1] + W_x(x[t]) + W_rec(s[t-1])
+    s[t] = fire(u[t])  if t % P == 0 else 0
+
+but in 2D convolutional form:
+    W_x   = Conv2d (spatial feature extraction)
+    W_rec = Conv2d (recurrence, kernel_size configurable: 1x1 or 3x3)
+
+With rec_kernel_size=3, signals propagate spatially through recurrence.
+Each layer adds 1 pixel of spatial reach per timestep.
+N layers × T timesteps → effective RF expansion of ~2NT pixels.
 """
 from typing import Dict, List, Optional, Tuple
 
 import torch as th
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 from omegaconf import DictConfig
 
 from data.utils.types import FeatureMap, BackboneFeatures
-from models.layers.spiking import SpikingConvBlock
 from models.layers.pelif_spiking import PeLIFNeuron2d
 from .base import BaseDetector
 
-# State types
-LIFState = Optional[th.Tensor]                               # membrane per conv layer
-PeLIFBlockState = Optional[Tuple[th.Tensor, th.Tensor]]      # (mem, prev_spike)
-StageState = Tuple[List[LIFState], PeLIFBlockState]           # (lif_mems, pelif_state)
+# State per layer: (membrane, prev_spike)
+LayerState = Optional[Tuple[th.Tensor, th.Tensor]]
+# State per stage: list of layer states
+StageState = List[LayerState]
+# State for whole backbone
 PeLIFStates = List[StageState]
 
 
-class PeLIFTemporalBlock(nn.Module):
-    """PeLIF temporal memory block with 1x1 Conv recurrence.
+class PeLIFConvBlock(nn.Module):
+    """Conv2d + PeLIF neuron + recurrent conv.
 
-    Placed at the end of each stage. Receives LIF features,
-    applies PeLIF dynamics for multi-timescale temporal memory.
+    Direct 2D conv analogue of PeLIFRecurrentLayer (src/layers/pelif_recurrent.py):
+        I[t] = W_x(x[t]) + W_rec(s[t-1])
+        u[t] = beta * u[t-1] + I[t]
+        s[t] = fire(u[t] - v_th)  if t % P == 0 else 0
+        u[t] -= s[t] * v_th
+
+    Args:
+        in_channels: input channels
+        out_channels: output channels (= hidden size)
+        kernel_size: spatial kernel for W_x
+        stride: spatial stride for W_x (for downsampling)
+        periods: clock periods for PeLIF neuron
+        rec_kernel_size: kernel for W_rec (1=temporal only, 3=spatial propagation)
+        beta_init: membrane decay init
+        learn_beta: learnable decay per channel
+        threshold: spike threshold
+        surrogate: surrogate gradient type
+        norm: 'bn' or 'none' — normalization on W_x output
     """
 
     def __init__(self,
-                 channels: int,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: int = 3,
+                 stride: int = 1,
                  periods: Tuple[int, ...] = (1, 2, 4, 8),
+                 rec_kernel_size: int = 1,
                  beta_init: float = 0.9,
                  learn_beta: bool = True,
                  threshold: float = 1.0,
-                 surrogate: str = 'triangle'):
+                 surrogate: str = 'triangle',
+                 norm: str = 'bn'):
         super().__init__()
+
+        padding = kernel_size // 2
+
+        # W_x: feedforward spatial conv
+        self.conv = nn.Conv2d(in_channels, out_channels,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding,
+                              bias=(norm == 'none'))
+        if norm == 'none':
+            self.bn = nn.Identity()
+        else:
+            self.bn = nn.BatchNorm2d(out_channels)
+
+        # W_rec: recurrent conv with spectral norm
+        rec_padding = rec_kernel_size // 2
+        conv_rec = nn.Conv2d(out_channels, out_channels,
+                             kernel_size=rec_kernel_size,
+                             padding=rec_padding,
+                             bias=False)
+        nn.init.orthogonal_(conv_rec.weight.view(out_channels, -1))
+        conv_rec.weight.data *= 0.5
+        self.conv_rec = spectral_norm(conv_rec)
+
+        # PeLIF neuron
         self.pelif = PeLIFNeuron2d(
-            channels=channels,
+            channels=out_channels,
             periods=periods,
             beta_init=beta_init,
             learn_beta=learn_beta,
-            surrogate=surrogate,
             threshold=threshold,
+            surrogate=surrogate,
         )
-        # 1x1 Conv recurrence (W_rec equivalent)
-        self.conv_rec = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        nn.init.orthogonal_(self.conv_rec.weight.view(channels, -1))
-        self.conv_rec.weight.data *= 0.5
 
     def forward(self,
                 x: th.Tensor,
-                state: PeLIFBlockState = None,
+                state: LayerState = None,
                 t: int = 0,
-                ) -> Tuple[th.Tensor, th.Tensor, PeLIFBlockState]:
+                ) -> Tuple[th.Tensor, th.Tensor, LayerState]:
         """
         Args:
-            x: (N, C, H, W) input from LIF conv layers
+            x: (N, C_in, H, W) input
             state: (mem, prev_spike) or None
             t: current timestep
         Returns:
-            spike: (N, C, H, W) binary
-            mem: (N, C, H, W) continuous (for FPN)
+            spike: (N, C_out, H', W') binary
+            mem: (N, C_out, H', W') continuous
             new_state: (mem, spike)
         """
         if state is not None:
-            mem, prev_spike = state
+            mem, s_prev = state
         else:
-            mem, prev_spike = None, None
+            mem, s_prev = None, None
 
-        cur = x
-        if prev_spike is not None:
-            cur = cur + self.conv_rec(prev_spike)
+        # I[t] = W_x(x[t]) + W_rec(s[t-1])
+        cur = self.bn(self.conv(x))
+        if s_prev is not None:
+            cur = cur + self.conv_rec(s_prev)
 
+        # u[t] = beta * u[t-1] + I[t], fire, reset
         spike, mem = self.pelif(cur, mem, t)
+
         return spike, mem, (mem, spike)
 
 
 class PeLIFCNNStage(nn.Module):
-    """One stage: LIF conv layers (spatial) + PeLIF block (temporal).
+    """Stage of stacked PeLIFConvBlocks.
 
     Architecture:
-        Conv2d+BN+LIF (downsample) → Conv2d+BN+LIF (refine) → PeLIF temporal block
+        PeLIFConvBlock (downsample, kernel=7 or 3) → PeLIFConvBlock (refine) × (N-1)
+
+    Every layer is recurrent. With N layers and rec_kernel_size=3,
+    each timestep propagates signals through N spatial hops.
     """
 
     def __init__(self,
                  dim_in: int,
                  dim_out: int,
                  spatial_downsample_factor: int,
-                 num_conv_layers: int,
+                 num_layers: int,
                  periods: Tuple[int, ...],
-                 snn_cfg: DictConfig,
-                 pelif_cfg: DictConfig):
+                 pelif_cfg: DictConfig,
+                 rec_kernel_size: int = 1,
+                 norm: str = 'bn'):
         super().__init__()
-        self.num_conv_layers = num_conv_layers
+        self.num_layers = num_layers
 
-        # SNN (LIF) kwargs for spatial feature extraction
-        snn_kwargs = dict(
-            beta_init=snn_cfg.get('beta_init', 0.9),
-            learn_beta=snn_cfg.get('learn_beta', True),
-            threshold=snn_cfg.get('threshold', 1.0),
-            reset_mechanism=snn_cfg.get('reset_mechanism', 'subtract'),
-            channelwise_beta=snn_cfg.get('channelwise_beta', False),
-            beta_spread=snn_cfg.get('beta_spread', 0.0),
+        pelif_kwargs = dict(
+            periods=periods,
+            rec_kernel_size=rec_kernel_size,
+            beta_init=pelif_cfg.get('beta_init', 0.9),
+            learn_beta=pelif_cfg.get('learn_beta', True),
+            threshold=pelif_cfg.get('threshold', 1.0),
+            surrogate=pelif_cfg.get('surrogate', 'triangle'),
+            norm=norm,
         )
 
-        # LIF conv layers (spatial feature extraction)
+        # First layer: downsample
         if spatial_downsample_factor == 4:
-            k, p = 7, 3
+            first_kernel = 7
         else:
-            k, p = 3, 1
+            first_kernel = 3
 
-        lif_layers = [SpikingConvBlock(
+        layers = [PeLIFConvBlock(
             in_channels=dim_in,
             out_channels=dim_out,
-            kernel_size=k,
+            kernel_size=first_kernel,
             stride=spatial_downsample_factor,
-            padding=p,
-            **snn_kwargs,
+            **pelif_kwargs,
         )]
-        for _ in range(num_conv_layers - 1):
-            lif_layers.append(SpikingConvBlock(
+
+        # Remaining layers: refine (stride=1)
+        for _ in range(num_layers - 1):
+            layers.append(PeLIFConvBlock(
                 in_channels=dim_out,
                 out_channels=dim_out,
                 kernel_size=3,
                 stride=1,
-                padding=1,
-                **snn_kwargs,
+                **pelif_kwargs,
             ))
-        self.lif_layers = nn.ModuleList(lif_layers)
 
-        # PeLIF temporal memory block (at stage end)
-        self.pelif_block = PeLIFTemporalBlock(
-            channels=dim_out,
-            periods=periods,
-            beta_init=pelif_cfg.get('beta_init', 0.9),
-            surrogate=pelif_cfg.get('surrogate', 'triangle'),
-            learn_beta=pelif_cfg.get('learn_beta', True),
-            threshold=pelif_cfg.get('threshold', 1.0),
-        )
+        self.layers = nn.ModuleList(layers)
 
     def forward(self,
                 x: th.Tensor,
@@ -152,31 +200,25 @@ class PeLIFCNNStage(nn.Module):
                 ) -> Tuple[FeatureMap, th.Tensor, StageState]:
         """
         Returns:
-            membrane: continuous feature for FPN (from PeLIF)
-            spike: binary for next stage (from PeLIF)
-            new_state: (lif_mems, pelif_state)
+            membrane: continuous feature for FPN (from last layer)
+            spike: binary for next stage input (from last layer)
+            new_state: list of (mem, spike) per layer
         """
-        if prev_state is not None:
-            lif_mems, pelif_state = prev_state
-        else:
-            lif_mems = [None] * self.num_conv_layers
-            pelif_state = None
+        if prev_state is None:
+            prev_state = [None] * self.num_layers
 
-        # LIF layers: spatial feature extraction
-        new_lif_mems = []
-        for i, layer in enumerate(self.lif_layers):
-            spike, mem = layer(x, lif_mems[i])
-            new_lif_mems.append(mem)
-            x = spike  # spike feeds next LIF layer
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            spike, mem, layer_state = layer(x, prev_state[i], t)
+            new_states.append(layer_state)
+            x = spike  # spike feeds next layer
 
-        # PeLIF block: temporal memory (receives LIF spike output)
-        pelif_spike, pelif_mem, new_pelif_state = self.pelif_block(x, pelif_state, t)
-
-        return pelif_mem, pelif_spike, (new_lif_mems, new_pelif_state)
+        # Last layer's membrane = stage output for FPN
+        return mem, spike, new_states
 
 
 class PeLIFCNNBackbone(BaseDetector):
-    """PeLIF-CNN backbone: LIF spatial + PeLIF temporal, 4 stages.
+    """PeLIF-CNN backbone: stacked PeLIF recurrent conv layers, 4 stages.
 
     Config keys (under model.backbone):
         name: "PeLIFCNN"
@@ -185,17 +227,14 @@ class PeLIFCNNBackbone(BaseDetector):
         dim_multiplier: [1, 2, 4, 8]
         num_conv_layers: [2, 2, 2, 2]
         periods: [1, 2, 4, 8]
+        rec_kernel_size: 1 or 3
         stem:
             patch_size: 4
-        snn:
-            beta_init: 0.9
-            learn_beta: true
-            threshold: 1.0
-            reset_mechanism: subtract
         pelif:
             beta_init: 0.9
             learn_beta: true
             threshold: 1.0
+            surrogate: triangle
     """
 
     def __init__(self, mdl_config: DictConfig):
@@ -207,8 +246,9 @@ class PeLIFCNNBackbone(BaseDetector):
         num_conv_layers_per_stage = tuple(mdl_config.num_conv_layers)
         patch_size = mdl_config.stem.patch_size
         periods = tuple(mdl_config.periods)
-        snn_cfg = mdl_config.snn
         pelif_cfg = mdl_config.pelif
+        rec_kernel_size = mdl_config.get('rec_kernel_size', 1)
+        norm = mdl_config.get('norm', 'bn')
 
         num_stages = len(dim_multiplier)
         assert num_stages == 4
@@ -227,10 +267,11 @@ class PeLIFCNNBackbone(BaseDetector):
                 dim_in=input_dim,
                 dim_out=stage_dim,
                 spatial_downsample_factor=ds_factor,
-                num_conv_layers=num_conv_layers_per_stage[stage_idx],
+                num_layers=num_conv_layers_per_stage[stage_idx],
                 periods=periods,
-                snn_cfg=snn_cfg,
                 pelif_cfg=pelif_cfg,
+                rec_kernel_size=rec_kernel_size,
+                norm=norm,
             ))
 
             stride *= ds_factor

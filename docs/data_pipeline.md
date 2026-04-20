@@ -120,25 +120,24 @@ for tidx in range(21):  # sequence_length
 **Padding:** 240x304 -> 256x320 (add 16px to bottom and right) to match
 `model.backbone.in_res_hw` which must be divisible by the total stride (4x2x2x2=32).
 
-### Stage 4: SNNCNNBackbone Forward (per timestep)
+### Stage 4: Recurrent Backbone Forward (per timestep)
+
+Each backbone progressively downsamples the padded input through four
+stages, emitting a feature map per stage for the FPN.  As a concrete
+example with total stride 32 (the `PeLIFCNN` shape):
 
 ```
 Input:    (N, 20, 256, 320)
               |
-Stage 0:  Conv2d(20->32, k=7, stride=4) + BN + LIF x2
-          (N, 32, 64, 80)     -> output[1] = membrane for FPN
-              | spike
-Stage 1:  Conv2d(32->64, k=3, stride=2) + BN + LIF x2
-          (N, 64, 32, 40)     -> output[2]
-              | spike
-Stage 2:  Conv2d(64->128, k=3, stride=2) + BN + LIF x2
-          (N, 128, 16, 20)    -> output[3]
-              | spike
-Stage 3:  Conv2d(128->256, k=3, stride=2) + BN + LIF x2
-          (N, 256, 8, 10)     -> output[4]
+Stage 0:  stride 4   ->  (N,  32, 64, 80)   -> output[1]
+Stage 1:  stride 2   ->  (N,  64, 32, 40)   -> output[2]
+Stage 2:  stride 2   ->  (N, 128, 16, 20)   -> output[3]
+Stage 3:  stride 2   ->  (N, 256,  8, 10)   -> output[4]
 ```
 
-Total spatial downsampling: 4 x 2 x 2 x 2 = **32x**
+Total spatial downsampling: 4 x 2 x 2 x 2 = **32x**.  See each backbone
+module under `models/detection/recurrent_backbone/` for the exact block
+composition (convolution vs. attention, recurrent cell, etc.).
 
 ### Stage 5: FPN + Detection Head
 

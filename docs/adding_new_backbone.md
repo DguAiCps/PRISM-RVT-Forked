@@ -32,10 +32,11 @@ def build_recurrent_backbone(backbone_cfg):
 ### 3. Add to `config/modifier.py`
 **`config/modifier.py`** — `dynamically_modify_train_config()`
 
-Add the backbone name to the appropriate `elif` branch. All current SNN backbones need resolution aligned to stride 32:
+Add the backbone name to the appropriate `elif` branch. Backbones with a
+total stride of 32 (e.g. `PeLIFCNN`) need resolution aligned accordingly:
 
 ```python
-elif backbone_name in ('SNNCNN', 'SNNSwin', 'NewBackbone'):
+elif backbone_name in ('PeLIFCNN', 'NewBackbone'):
     mdl_hw = _get_modified_hw_multiple_of(hw=dataset_hw, multiple_of=32)
     ...
 ```

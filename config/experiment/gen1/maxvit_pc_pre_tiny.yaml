@@ -1,0 +1,10 @@
+# @package _global_
+# Tiny variant of maxvit_pc_pre_default: embed_dim 64 -> 32, FPN depth 0.67 -> 0.33.
+defaults:
+  - maxvit_pc_pre_default
+
+model:
+  backbone:
+    embed_dim: 32
+  fpn:
+    depth: 0.33

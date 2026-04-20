@@ -12,6 +12,7 @@ except ImportError:
 from data.utils.types import FeatureMap, BackboneFeatures, LstmState, LstmStates
 from models.layers.rnn import DWSConvLSTM2d
 from models.layers.pelif_rnn import PeLIFConv2d
+from models.layers.phase_coded_rnn import PhaseCodedConv2d
 from models.layers.maxvit.maxvit import (
     PartitionAttentionCl,
     nChw_2_nhwC,
@@ -147,13 +148,14 @@ class RNNDetectorStage(nn.Module):
         lstm_cfg = stage_cfg.lstm
         attention_cfg = stage_cfg.attention
 
-        # Recurrent module: select between DWSConvLSTM2d (default) and PeLIFConv2d.
-        # Config keys:
-        #   stage.lstm.type  — 'lstm' (default) or 'pelif'
-        #   stage.lstm.order — 'post' (default, RNN after attention) or 'pre' (RNN before attention)
+        # Recurrent module: select between DWSConvLSTM2d (default), PeLIFConv2d,
+        # or PhaseCodedConv2d. Config keys:
+        #   stage.lstm.type  — 'lstm' (default) | 'pelif' | 'phase_coded'
+        #   stage.lstm.order — 'post' (default, RNN after attention) |
+        #                      'pre'  (RNN before attention, for pelif/phase_coded)
         rnn_type = lstm_cfg.get('type', 'lstm')
         rnn_order = lstm_cfg.get('order', 'post')
-        self.rnn_before_attn = (rnn_type == 'pelif' and rnn_order == 'pre')
+        self.rnn_before_attn = (rnn_type in ('pelif', 'phase_coded') and rnn_order == 'pre')
 
         self.downsample_cf2cl = get_downsample_layer_Cf2Cl(dim_in=dim_in,
                                                            dim_out=stage_dim,
@@ -185,8 +187,22 @@ class RNNDetectorStage(nn.Module):
                 dws_conv_kernel_size=lstm_cfg.get('dws_conv_kernel_size', 3),
                 surrogate=lstm_cfg.get('surrogate', 'triangle'),
                 cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
+        elif rnn_type == 'phase_coded':
+            self.lstm = PhaseCodedConv2d(
+                dim=stage_dim,
+                n_bits=lstm_cfg.get('n_bits', 4),
+                v_th=lstm_cfg.get('v_th', 1.0),
+                alpha=lstm_cfg.get('alpha', 0.8),
+                threshold_mode=lstm_cfg.get('threshold_mode', 'uniform'),
+                surrogate_k=lstm_cfg.get('surrogate_k', 1.0),
+                normalize_peaks=lstm_cfg.get('normalize_peaks', True),
+                dws_conv_x=lstm_cfg.get('dws_conv_x', True),
+                dws_conv_kernel_size=lstm_cfg.get('dws_conv_kernel_size', 3),
+                cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
         else:
-            raise ValueError(f"Unknown rnn type '{rnn_type}'. Expected 'lstm' or 'pelif'.")
+            raise ValueError(
+                f"Unknown rnn type '{rnn_type}'. Expected 'lstm', 'pelif', "
+                f"or 'phase_coded'.")
 
         ###### Mask Token ################
         self.mask_token = nn.Parameter(th.zeros(1, 1, 1, stage_dim),

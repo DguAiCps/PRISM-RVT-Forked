@@ -46,8 +46,12 @@ model:
         # threshold scale v_th[g] (scalar v_th also accepted, broadcast to
         # all groups).
         n_bits_groups: [1, 2, 4, 8]
-        v_th: 2.0
-        alpha: 0.9
+        # Slowest group (P=8) uses a wider v_th so its LSB is not
+        # saturated at near-zero membrane values (at v_th=2 the P=8 LSB
+        # threshold is only 0.0078, which drives most positive v to emit
+        # a 1 on LSB — no information).
+        v_th: [2.0, 2.0, 2.0, 8.0]
+        alpha: 0.8
         threshold_mode: fs
         surrogate_k: 1.0
         normalize_peaks: True

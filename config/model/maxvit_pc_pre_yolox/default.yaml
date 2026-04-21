@@ -41,9 +41,13 @@ model:
       lstm:
         type: phase_coded
         order: pre
-        n_bits: 4
-        v_th: 4.0
-        alpha: 0.8
+        # Multi-rate channel groups: channels split into len(n_bits_groups)
+        # equal-ish groups; group g uses period P_g = n_bits_groups[g] and
+        # threshold scale v_th[g] (scalar v_th also accepted, broadcast to
+        # all groups).
+        n_bits_groups: [1, 2, 4, 8]
+        v_th: 2.0
+        alpha: 0.9
         threshold_mode: fs
         surrogate_k: 1.0
         normalize_peaks: True

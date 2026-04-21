@@ -188,10 +188,22 @@ class RNNDetectorStage(nn.Module):
                 surrogate=lstm_cfg.get('surrogate', 'triangle'),
                 cell_update_dropout=lstm_cfg.get('drop_cell_update', 0))
         elif rnn_type == 'phase_coded':
+            # n_bits_groups (new multi-rate API) takes precedence; fall back
+            # to scalar n_bits (wrapped as a single-group list) for
+            # backward-compat with older configs.
+            if 'n_bits_groups' in lstm_cfg:
+                n_bits_groups = list(lstm_cfg.n_bits_groups)
+            else:
+                n_bits_groups = [lstm_cfg.get('n_bits', 4)]
+            v_th_cfg = lstm_cfg.get('v_th', 1.0)
+            if isinstance(v_th_cfg, (int, float)):
+                v_th_arg = float(v_th_cfg)
+            else:
+                v_th_arg = [float(v) for v in v_th_cfg]
             self.lstm = PhaseCodedConv2d(
                 dim=stage_dim,
-                n_bits=lstm_cfg.get('n_bits', 4),
-                v_th=lstm_cfg.get('v_th', 1.0),
+                n_bits_groups=n_bits_groups,
+                v_th=v_th_arg,
                 alpha=lstm_cfg.get('alpha', 0.8),
                 threshold_mode=lstm_cfg.get('threshold_mode', 'uniform'),
                 surrogate_k=lstm_cfg.get('surrogate_k', 1.0),

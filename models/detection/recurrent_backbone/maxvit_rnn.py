@@ -205,6 +205,7 @@ class RNNDetectorStage(nn.Module):
                 n_bits_groups=n_bits_groups,
                 v_th=v_th_arg,
                 alpha=lstm_cfg.get('alpha', 0.8),
+                learn_alpha=lstm_cfg.get('learn_alpha', False),
                 threshold_mode=lstm_cfg.get('threshold_mode', 'uniform'),
                 surrogate_k=lstm_cfg.get('surrogate_k', 1.0),
                 normalize_peaks=lstm_cfg.get('normalize_peaks', True),

@@ -52,6 +52,10 @@ model:
         # a 1 on LSB — no information).
         v_th: [2.0, 2.0, 2.0, 8.0]
         alpha: 0.8
+        # Per-channel learnable decay (PeLIF-parity with learn_beta=True).
+        # alpha init to the scalar above via sigmoid logit;
+        # downstream params: dim scalars per stage.
+        learn_alpha: True
         threshold_mode: fs
         surrogate_k: 1.0
         normalize_peaks: True

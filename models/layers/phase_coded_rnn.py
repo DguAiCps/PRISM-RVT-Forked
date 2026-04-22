@@ -34,6 +34,7 @@ Notes:
       encoding / streaming schedule.
 """
 
+import math
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -65,6 +66,7 @@ class PhaseCodedConv2d(nn.Module):
                  n_bits_groups: Sequence[int] = (1, 2, 4, 8),
                  v_th: Union[float, Sequence[float]] = 1.0,
                  alpha: float = 0.8,
+                 learn_alpha: bool = False,
                  threshold_mode: str = 'uniform',
                  surrogate_k: float = 1.0,
                  normalize_peaks: bool = True,
@@ -73,6 +75,7 @@ class PhaseCodedConv2d(nn.Module):
                  cell_update_dropout: float = 0.0):
         super().__init__()
         self.dim = dim
+        self.learn_alpha = bool(learn_alpha)
 
         n_bits_list = [int(n) for n in n_bits_groups]
         assert len(n_bits_list) > 0, "n_bits_groups cannot be empty"
@@ -90,7 +93,18 @@ class PhaseCodedConv2d(nn.Module):
                 f"n_bits_groups length {self.num_groups}")
         self.v_th_groups = v_th_list
 
-        self.alpha = alpha
+        # Alpha: fixed scalar (legacy) or per-channel learnable (PeLIF-parity).
+        # When learnable, we parameterize the logit and apply sigmoid in the
+        # forward so alpha stays in (0, 1). Initial logit is set so that
+        # sigmoid(init_logit) == alpha.
+        if self.learn_alpha:
+            assert 0.0 < alpha < 1.0, (
+                f"alpha must be in (0, 1) when learn_alpha=True, got {alpha}")
+            init_logit = math.log(alpha / (1.0 - alpha))
+            self.alpha_logit = nn.Parameter(torch.full((dim,), init_logit))
+            self.alpha_init = alpha  # kept for logging / introspection
+        else:
+            self.alpha = alpha
         self.threshold_mode = threshold_mode
         self.surrogate_k = surrogate_k
         self.normalize_peaks = normalize_peaks
@@ -189,7 +203,14 @@ class PhaseCodedConv2d(nn.Module):
                 if (self.dropout is not None and self.training) else q_t)
 
         # State update — W_x, W_r apply to the full channel stack.
-        v_minus = self.alpha * v + self.W_x(self.dws_x(x)) + self.W_r(q_in)
+        # When learn_alpha is True, alpha is a per-channel sigmoid-
+        # parameterized vector broadcast across (N, H, W).
+        if self.learn_alpha:
+            alpha_vec = torch.sigmoid(self.alpha_logit).view(1, -1, 1, 1)
+            v_decayed = alpha_vec * v
+        else:
+            v_decayed = self.alpha * v
+        v_minus = v_decayed + self.W_x(self.dws_x(x)) + self.W_r(q_in)
 
         # Per-group encoding / accumulation
         v_new_parts: List[torch.Tensor] = []
